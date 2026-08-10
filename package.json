@@ -1,0 +1,9 @@
+{
+  "name": "openbattle-assistant",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome extension for openbattle.ir: one-key building under the cursor and an auto-play bot for singleplayer and private lobbies.",
+  "scripts": {
+    "test": "node test/smoke.js"
+  }
+}

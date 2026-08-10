@@ -1,0 +1,554 @@
+/*
+ * Headless smoke test for the page-world code.
+ *
+ * Builds a mock GameView with the same surface the real one exposes, loads
+ * bridge.js + bot.js into a VM sandbox, and drives a short match to check that
+ * each subsystem emits the intents it should.
+ *
+ *   node test/smoke.js
+ */
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+
+const ROOT = path.join(__dirname, "..");
+
+/* ------------------------------------------------------------------ *
+ * Mock world                                                          *
+ * ------------------------------------------------------------------ */
+const W = 160;
+const H = 100;
+
+// Land on the left two thirds, ocean on the right, plus a lake and a
+// mountain ridge so terrain predicates get exercised.
+const LAND = new Uint8Array(W * H);
+const OCEAN = new Uint8Array(W * H);
+const IMPASSABLE = new Uint8Array(W * H);
+for (let y = 0; y < H; y++) {
+  for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    const isLand = x < 104 + Math.round(6 * Math.sin(y / 7));
+    const inLake = x > 20 && x < 30 && y > 40 && y < 50;
+    if (isLand && !inLake) {
+      LAND[i] = 1;
+      if (x > 60 && x < 64 && y > 10 && y < 30) IMPASSABLE[i] = 1;
+    } else if (!inLake) {
+      OCEAN[i] = 1;
+    }
+  }
+}
+
+const owner = new Int32Array(W * H); // 0 = TerraNullius
+
+const UnitType = {
+  City: "City",
+  Port: "Port",
+  Factory: "Factory",
+  DefensePost: "Defense Post",
+  MissileSilo: "Missile Silo",
+  SAMLauncher: "SAM Launcher",
+  Warship: "Warship",
+  AtomBomb: "Atom Bomb",
+  HydrogenBomb: "Hydrogen Bomb",
+};
+
+const sent = [];
+
+function makePlayer(game, smallID, id, opts) {
+  const p = {
+    _units: [],
+    _out: [],
+    _in: [],
+    _gold: opts.gold || 0,
+    _troops: opts.troops || 0,
+    _type: opts.type || "HUMAN",
+    _spawned: opts.spawned !== false,
+    smallID: () => smallID,
+    id: () => id,
+    name: () => id,
+    displayName: () => id,
+    isPlayer: () => true,
+    isAlive: () => true,
+    hasSpawned: () => p._spawned,
+    type: () => p._type,
+    troops: () => p._troops,
+    gold: () => BigInt(Math.round(p._gold)),
+    numTilesOwned: () => {
+      let n = 0;
+      for (let i = 0; i < owner.length; i++) if (owner[i] === smallID) n++;
+      return n;
+    },
+    units: (...types) =>
+      types.length === 0
+        ? p._units
+        : p._units.filter((u) => types.includes(u.type())),
+    outgoingAttacks: () => p._out,
+    incomingAttacks: () => p._in,
+    allies: () => [],
+    isFriendly: () => false,
+    isTraitor: () => false,
+    isRequestingAllianceWith: () => false,
+    borderTiles: async () => {
+      const set = new Set();
+      for (let i = 0; i < owner.length; i++) {
+        if (owner[i] !== smallID) continue;
+        const x = i % W,
+          y = (i / W) | 0;
+        let border = false;
+        for (const [dx, dy] of [
+          [1, 0],
+          [-1, 0],
+          [0, 1],
+          [0, -1],
+        ]) {
+          const nx = x + dx,
+            ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+          if (owner[ny * W + nx] !== smallID) border = true;
+        }
+        if (border) set.add(i);
+      }
+      return { borderTiles: set };
+    },
+    // The real implementation runs in the sim worker; this mirrors the parts
+    // the bot depends on: legality plus price.
+    actions: async (tile, types) => {
+      const list = (types || []).map((t) => {
+        const canPlace =
+          LAND[tile] === 1 && !IMPASSABLE[tile] && owner[tile] === smallID;
+        const needsShore = t === UnitType.Port;
+        const needsWater = t === UnitType.Warship;
+        let ok = canPlace;
+        if (needsShore) ok = canPlace && game.isOceanShore(tile);
+        if (needsWater) ok = game.isOcean(tile);
+        if (t === UnitType.AtomBomb || t === UnitType.HydrogenBomb) ok = true;
+        return {
+          type: t,
+          canBuild: ok ? tile : false,
+          canUpgrade: false,
+          cost: BigInt(COSTS[t] || 100000),
+          overlappingRailroads: [],
+          ghostRailPaths: [],
+        };
+      });
+      return { canAttack: true, buildableUnits: list, canSendEmojiAllPlayers: true };
+    },
+    bestTransportShipSpawn: async () => 1,
+  };
+  return p;
+}
+
+const COSTS = {
+  City: 125000,
+  Port: 125000,
+  Factory: 200000,
+  "Defense Post": 50000,
+  "Missile Silo": 1000000,
+  "SAM Launcher": 1500000,
+  Warship: 250000,
+  "Atom Bomb": 750000,
+  "Hydrogen Bomb": 5000000,
+};
+
+function makeUnit(type, tile, ownerPlayer) {
+  return {
+    type: () => type,
+    tile: () => tile,
+    owner: () => ownerPlayer,
+    isActive: () => true,
+    isUnderConstruction: () => false,
+    level: () => 1,
+  };
+}
+
+const game = {
+  _ticks: 0,
+  _spawn: true,
+  _players: [],
+  ticks: () => game._ticks,
+  inSpawnPhase: () => game._spawn,
+  width: () => W,
+  height: () => H,
+  ref: (x, y) => y * W + x,
+  x: (t) => t % W,
+  y: (t) => (t / W) | 0,
+  isValidCoord: (x, y) => x >= 0 && y >= 0 && x < W && y < H,
+  isLand: (t) => LAND[t] === 1,
+  isImpassable: (t) => IMPASSABLE[t] === 1,
+  isOcean: (t) => OCEAN[t] === 1,
+  isOceanShore: (t) => {
+    if (LAND[t] !== 1) return false;
+    const x = t % W,
+      y = (t / W) | 0;
+    for (const [dx, dy] of [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1],
+    ]) {
+      const nx = x + dx,
+        ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      if (OCEAN[ny * W + nx] === 1) return true;
+    }
+    return false;
+  },
+  hasOwner: (t) => owner[t] !== 0,
+  ownerID: (t) => owner[t],
+  isBorder: (t) => {
+    const sid = owner[t];
+    const x = t % W,
+      y = (t / W) | 0;
+    for (const [dx, dy] of [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1],
+    ]) {
+      const nx = x + dx,
+        ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      if (owner[ny * W + nx] !== sid) return true;
+    }
+    return false;
+  },
+  neighbors: (t) => {
+    const x = t % W,
+      y = (t / W) | 0;
+    const out = [];
+    if (x > 0) out.push(t - 1);
+    if (x < W - 1) out.push(t + 1);
+    if (y > 0) out.push(t - W);
+    if (y < H - 1) out.push(t + W);
+    return out;
+  },
+  euclideanDistSquared: (a, b) => {
+    const dx = (a % W) - (b % W);
+    const dy = ((a / W) | 0) - ((b / W) | 0);
+    return dx * dx + dy * dy;
+  },
+  players: () => game._players,
+  playerBySmallID: (sid) =>
+    game._players.find((p) => p.smallID() === sid) || {
+      isPlayer: () => false,
+      smallID: () => 0,
+    },
+  myPlayer: () => game._players[0],
+  units: (...types) => {
+    const all = [];
+    for (const p of game._players) all.push(...p.units(...types));
+    return all;
+  },
+  config: () => ({
+    maxTroops: (p) => 2 * (Math.pow(p.numTilesOwned(), 0.6) * 1000 + 50000),
+    structureMinDist: () => 15,
+  }),
+};
+
+/* ------------------------------------------------------------------ *
+ * Sandbox                                                             *
+ * ------------------------------------------------------------------ */
+const buildMenu = { game: game, eventBus: {}, uiState: {}, transformHandler: null };
+
+const sandbox = {
+  console,
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+  Date,
+  Math,
+  JSON,
+  Promise,
+  Reflect,
+  Object,
+  Array,
+  Number,
+  String,
+  BigInt,
+  Float32Array,
+  Float64Array,
+  Int32Array,
+  Uint8Array,
+  Set,
+  Map,
+  Error,
+  isNaN,
+  document: {
+    querySelector: (sel) => (sel === "build-menu" ? buildMenu : null),
+  },
+  location: { origin: "https://openbattle.ir" },
+};
+sandbox.window = sandbox;
+
+// Record what actually reaches the "native" transports, so the tests can
+// assert on the bytes the game would really have seen.
+const workerCalls = [];
+const socketCalls = [];
+sandbox.Worker = class {
+  constructor(url) {
+    this.url = url;
+  }
+};
+sandbox.Worker.prototype.postMessage = function (msg) {
+  workerCalls.push(msg);
+};
+sandbox.WebSocket = class {
+  constructor() {
+    this.readyState = 1;
+  }
+};
+sandbox.WebSocket.prototype.send = function (data) {
+  socketCalls.push(data);
+};
+
+vm.createContext(sandbox);
+for (const f of ["src/page/bridge.js", "src/page/bot.js"]) {
+  vm.runInContext(fs.readFileSync(path.join(ROOT, f), "utf8"), sandbox, {
+    filename: f,
+  });
+}
+
+const OBA = sandbox.__OBA__;
+const realSendIntent = OBA.sendIntent;
+// Capture instead of transmitting — there is no real game to talk to.
+OBA.sendIntent = (intent) => {
+  sent.push(intent);
+  return "test";
+};
+OBA.onLog((e) => logs.push(e));
+const logs = [];
+
+/* ------------------------------------------------------------------ *
+ * Assertions                                                          *
+ * ------------------------------------------------------------------ */
+let failures = 0;
+function check(name, cond, detail) {
+  if (cond) {
+    console.log("  \x1b[32mPASS\x1b[0m " + name);
+  } else {
+    failures++;
+    console.log("  \x1b[31mFAIL\x1b[0m " + name + (detail ? " — " + detail : ""));
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function pump(ticks) {
+  for (let i = 0; i < ticks; i++) {
+    game._ticks++;
+    OBA.Bot.step();
+    await sleep(0); // let the mocked worker promises settle
+  }
+}
+
+(async function run() {
+  const bot = OBA.Bot;
+
+  console.log("\n1. bridge wiring");
+  check("GameView reachable through the HUD element", OBA.getGame() === game);
+  const snap = OBA.snapshot();
+  check("snapshot reports attached", snap.attached === true);
+
+  console.log("\n2. spawn selection");
+  const me = makePlayer(game, 1, "me", { gold: 0, troops: 0, spawned: false });
+  game._players = [me];
+  bot.setConfig({ preset: "balanced" });
+  bot.running = true;
+  await pump(12);
+
+  const spawn = sent.find((i) => i.type === "spawn");
+  check("emits a spawn intent", !!spawn, JSON.stringify(sent.slice(0, 3)));
+  if (spawn) {
+    const t = spawn.tile;
+    check("spawn tile is land", LAND[t] === 1);
+    check("spawn tile is passable", IMPASSABLE[t] !== 1);
+    check("spawn tile is unclaimed", owner[t] === 0);
+    check(
+      "spawn tile is on the coast (ports are the strongest opening)",
+      game.isOceanShore(t),
+      "x=" + game.x(t) + " y=" + game.y(t),
+    );
+    // The scorer should avoid the impassable ridge and the lake.
+    check("spawn avoids the lake pocket", !(game.x(t) > 20 && game.x(t) < 30 && game.y(t) > 40 && game.y(t) < 50));
+  }
+
+  console.log("\n3. expansion");
+  // Give ourselves a blob of territory that reaches the coast, plus troops.
+  const cx = 104,
+    cy = 50;
+  for (let y = cy - 8; y <= cy + 8; y++)
+    for (let x = cx - 8; x <= cx + 8; x++)
+      if (LAND[y * W + x]) owner[y * W + x] = 1;
+  me._troops = 90000;
+  me._spawned = true;
+  game._spawn = false;
+  sent.length = 0;
+  bot.next = {};
+  await pump(40);
+
+  const expand = sent.find((i) => i.type === "attack" && i.targetID === null);
+  check("attacks unclaimed land while it is available", !!expand);
+  check(
+    "commits a large share of troops to the land grab",
+    !!expand && expand.troops > me._troops * 0.5,
+    expand ? "troops=" + expand.troops : "",
+  );
+
+  console.log("\n4. economy");
+  me._gold = 3000000;
+  sent.length = 0;
+  bot.next = {};
+  await pump(60);
+  const builds = sent.filter((i) => i.type === "build_unit");
+  check("builds structures once gold allows", builds.length > 0);
+  check(
+    "opens with a port on the coast",
+    builds.some((b) => b.unit === UnitType.Port),
+    builds.map((b) => b.unit).join(","),
+  );
+
+  console.log("\n5. attacking a weaker neighbour");
+  const foe = makePlayer(game, 2, "foe", { gold: 0, troops: 5000, type: "BOT" });
+  game._players.push(foe);
+  // Claim the tiles directly west of us for the enemy so we share a border.
+  for (let y = cy - 6; y <= cy + 6; y++)
+    for (let x = cx - 18; x < cx - 8; x++)
+      if (LAND[y * W + x]) owner[y * W + x] = 2;
+  // Close off the neutral frontier so the bot prefers war over expansion.
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++)
+      if (LAND[y * W + x] && owner[y * W + x] === 0) owner[y * W + x] = 3;
+  const filler = makePlayer(game, 3, "filler", { troops: 10000000 });
+  game._players.push(filler);
+
+  sent.length = 0;
+  bot.next = {};
+  bot.territory = null;
+  await pump(60);
+  const strike = sent.find((i) => i.type === "attack" && i.targetID === "foe");
+  check("opens an attack on the weak neighbour", !!strike);
+  check(
+    "leaves the much stronger neighbour alone",
+    !sent.some((i) => i.type === "attack" && i.targetID === "filler"),
+  );
+
+  console.log("\n6. nukes");
+  me._gold = 12000000;
+  me._units.push(makeUnit(UnitType.MissileSilo, cy * W + cx, me));
+  for (let k = 0; k < 6; k++)
+    foe._units.push(makeUnit(UnitType.City, (cy + k) * W + (cx - 12), foe));
+  sent.length = 0;
+  bot.next = {};
+  await pump(60);
+  check(
+    "fires a warhead at the enemy structure cluster",
+    sent.some(
+      (i) =>
+        i.type === "build_unit" &&
+        (i.unit === UnitType.AtomBomb || i.unit === UnitType.HydrogenBomb),
+    ),
+    sent.map((s) => s.type + ":" + (s.unit || "")).join(" "),
+  );
+
+  console.log("\n7. lifecycle");
+  bot.stop();
+  sent.length = 0;
+  await pump(20);
+  check("stops emitting once halted, including in-flight builds", sent.length === 0,
+    JSON.stringify(sent));
+
+  console.log("\n8. intent transports");
+  OBA.sendIntent = realSendIntent;
+  OBA.state.gameSocket = null;
+  OBA.state.gameWorker = null;
+  OBA.state.pendingIntents.length = 0;
+
+  // Singleplayer: no socket, so the intent must ride the next turn message.
+  const worker = vm.runInContext("new Worker('blob:sim')", sandbox);
+  worker.postMessage({ type: "init", clientID: "me-client" });
+  check("worker init is recognised", OBA.state.gameWorker === worker);
+
+  const route = OBA.sendIntent({ type: "spawn", tile: 42 });
+  check("routes to the local turn queue when there is no socket", route === "local");
+
+  workerCalls.length = 0;
+  worker.postMessage({ type: "turn", turn: { turnNumber: 7, intents: [], hash: null } });
+  const forwarded = workerCalls[workerCalls.length - 1];
+  check(
+    "injects the queued intent into the outgoing turn",
+    forwarded &&
+      forwarded.type === "turn" &&
+      forwarded.turn.intents.length === 1 &&
+      forwarded.turn.intents[0].type === "spawn" &&
+      forwarded.turn.intents[0].clientID === "me-client",
+    JSON.stringify(forwarded),
+  );
+  check("preserves the turn number", forwarded && forwarded.turn.turnNumber === 7);
+  check("drains the queue after forwarding", OBA.state.pendingIntents.length === 0);
+
+  // Multiplayer: once the game socket announces itself, intents go over it.
+  const ws = vm.runInContext("new WebSocket('wss://openbattle.ir/w0/game')", sandbox);
+  ws.send(JSON.stringify({ type: "join", gameID: "abc123", username: "me" }));
+  check("game socket is identified from its join frame", OBA.state.gameSocket === ws);
+
+  socketCalls.length = 0;
+  const route2 = OBA.sendIntent({ type: "attack", targetID: "foe", troops: 10 });
+  check("prefers the socket when one is open", route2 === "ws");
+  const frame = JSON.parse(socketCalls[socketCalls.length - 1]);
+  check(
+    "sends the wire shape the server expects",
+    frame.type === "intent" && frame.intent.type === "attack" && frame.intent.troops === 10,
+    JSON.stringify(frame),
+  );
+  check("does not double-queue on the local path", OBA.state.pendingIntents.length === 0);
+
+  console.log("\n9. one-key building under the cursor");
+  // Identity transform keeps screen coordinates equal to tile coordinates.
+  buildMenu.transformHandler = {
+    screenToWorldCoordinates: (sx, sy) => ({ x: sx, y: sy }),
+  };
+  me._gold = 5000000;
+
+  socketCalls.length = 0;
+  const good = await OBA.quickBuild(UnitType.City, cx, cy, {});
+  check("places a structure at the cursor tile", good.ok === true, JSON.stringify(good));
+  check("reports it as a build, not an upgrade", good.mode === "build");
+  const placed = JSON.parse(socketCalls[socketCalls.length - 1] || "null");
+  check(
+    "sends a build_unit intent for the tile under the cursor",
+    placed &&
+      placed.intent.type === "build_unit" &&
+      placed.intent.unit === UnitType.City &&
+      placed.intent.tile === cy * W + cx,
+    JSON.stringify(placed),
+  );
+
+  socketCalls.length = 0;
+  const onWater = await OBA.quickBuild(UnitType.City, 150, 50, {});
+  check("refuses a spot the game would reject", onWater.ok === false, JSON.stringify(onWater));
+  check("sends nothing when it refuses", socketCalls.length === 0);
+
+  const offMap = await OBA.quickBuild(UnitType.City, 9999, 9999, {});
+  check("refuses coordinates off the map", offMap.ok === false && offMap.reason === "off_map");
+
+  // With every transport gone the player must be told, not shown a fake success.
+  OBA.state.gameSocket = null;
+  OBA.state.gameWorker = null;
+  const orphan = await OBA.quickBuild(UnitType.City, cx, cy + 1, {});
+  check(
+    "reports no_transport instead of a false success",
+    orphan.ok === false && orphan.reason === "no_transport",
+    JSON.stringify(orphan),
+  );
+
+  console.log(
+    "\n" +
+      (failures === 0
+        ? "\x1b[32mall checks passed\x1b[0m"
+        : "\x1b[31m" + failures + " check(s) failed\x1b[0m"),
+  );
+  process.exit(failures === 0 ? 0 : 1);
+})();

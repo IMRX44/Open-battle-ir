@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+  <head>
+    <meta charset="utf-8" />
+    <title>دستیار اوپن‌بتل</title>
+    <style>
+      :root {
+        --bg: #0d1120;
+        --soft: rgba(255, 255, 255, 0.05);
+        --line: rgba(255, 255, 255, 0.09);
+        --txt: #e7ecf6;
+        --muted: #8e9ab1;
+        --accent: #7c5cff;
+        --accent-2: #22d3ee;
+        --good: #34d399;
+        --bad: #f87171;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        width: 268px;
+        background: var(--bg);
+        color: var(--txt);
+        font-family: "Vazirmatn", "IRANSans", "Segoe UI", Tahoma, system-ui, sans-serif;
+        padding: 14px;
+      }
+      .head { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
+      .mark {
+        width: 30px; height: 30px; border-radius: 9px;
+        background: linear-gradient(140deg, var(--accent), var(--accent-2));
+        display: grid; place-items: center; font-size: 16px;
+      }
+      h1 { font-size: 13.5px; }
+      .sub { font-size: 10.5px; color: var(--muted); margin-top: 1px; }
+      .card {
+        background: var(--soft); border: 1px solid var(--line);
+        border-radius: 11px; padding: 10px; margin-bottom: 8px;
+        font-size: 11.5px; line-height: 1.8; color: var(--muted);
+      }
+      .card b { color: var(--txt); font-weight: 700; }
+      .state { display: flex; align-items: center; gap: 7px; font-size: 11.5px; margin-bottom: 10px; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+      .dot.ok { background: var(--good); box-shadow: 0 0 8px var(--good); }
+      button {
+        width: 100%; padding: 10px; border: 0; border-radius: 10px;
+        font-family: inherit; font-size: 12.5px; font-weight: 700;
+        color: #fff; cursor: pointer; margin-bottom: 7px;
+        background: linear-gradient(130deg, var(--accent), var(--accent-2));
+      }
+      button.ghost {
+        background: var(--soft); border: 1px solid var(--line); color: var(--txt);
+      }
+      button:disabled { opacity: 0.45; cursor: not-allowed; }
+      kbd {
+        background: rgba(255,255,255,.08); border: 1px solid var(--line);
+        border-bottom-width: 2px; border-radius: 6px;
+        padding: 1px 6px; font-size: 10.5px; direction: ltr; display: inline-block;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="head">
+      <div class="mark">⚔️</div>
+      <div>
+        <h1>دستیار اوپن‌بتل</h1>
+        <div class="sub">openbattle.ir</div>
+      </div>
+    </div>
+
+    <div class="state"><span class="dot" id="dot"></span><span id="stateText">در حال بررسی…</span></div>
+
+    <button id="open">باز کردن پنل</button>
+    <button class="ghost" id="bot" disabled>شروع بازی خودکار</button>
+
+    <div class="card">
+      پنل با <kbd>Ctrl + Shift + O</kbd> هم باز و بسته می‌شود.<br />
+      برای ساخت آنی، کلید <kbd>Shift + 1..0</kbd> را همان‌جا که نشانگر ماوس است بزن.
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
