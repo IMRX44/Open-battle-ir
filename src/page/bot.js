@@ -209,7 +209,9 @@
   /* ---------------------------- main step --------------------------- */
   Bot.prototype.step = function () {
     if (!this.running) return;
-    var g = OBA.getGame();
+    // The compatibility view fills in whatever this deployment's GameView is
+    // missing, so a subsystem never dies on an absent helper.
+    var g = OBA.view();
     if (!g) return;
 
     var tick;
@@ -463,89 +465,136 @@
     this.busy.territory = true;
     var self = this;
 
-    me.borderTiles()
+    var pending = null;
+    try {
+      if (typeof me.borderTiles === "function") pending = me.borderTiles();
+    } catch (e) {
+      pending = null;
+    }
+
+    // Older builds may not expose borderTiles; scanning for it ourselves is
+    // slower but keeps every downstream subsystem alive.
+    if (!pending || typeof pending.then !== "function") {
+      try {
+        self.analyzeTerritory(g, me, self.scanBorder(g, me));
+      } catch (e) {
+        OBA.log("error", "territory scan failed: " + e);
+      }
+      self.busy.territory = false;
+      return;
+    }
+
+    pending
       .then(function (res) {
         var set = res && res.borderTiles ? res.borderTiles : null;
         if (!set) return;
-
-        var sid = me.smallID();
         var border = [];
-        var minX = Infinity,
-          maxX = -Infinity,
-          minY = Infinity,
-          maxY = -Infinity;
-
         set.forEach(function (t) {
           border.push(t);
-          var x = g.x(t),
-            y = g.y(t);
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
         });
-        if (!border.length) return;
-
-        // Who are we actually touching, and how much of our edge faces them?
-        var neutralEdge = 0;
-        var enemyEdge = Object.create(null);
-        var enemyTile = Object.create(null);
-        var sample = border.length > 20000 ? (border.length / 20000) | 0 : 1;
-        for (var i = 0; i < border.length; i += sample) {
-          var t = border[i];
-          var nb = g.neighbors(t);
-          for (var k = 0; k < nb.length; k++) {
-            var nt = nb[k];
-            if (!g.isLand(nt) || g.isImpassable(nt)) continue;
-            var o = g.ownerID(nt);
-            if (o === sid) continue;
-            if (!g.hasOwner(nt)) {
-              neutralEdge++;
-            } else {
-              enemyEdge[o] = (enemyEdge[o] || 0) + 1;
-              if (enemyTile[o] === undefined) enemyTile[o] = t;
-            }
-          }
-        }
-
-        // Interior / shore candidates for construction.
-        var bw = maxX - minX + 1,
-          bh = maxY - minY + 1;
-        var stride = Math.max(1, Math.round(Math.sqrt((bw * bh) / 24000)));
-        var interior = [],
-          shore = [];
-        for (var y2 = minY; y2 <= maxY; y2 += stride) {
-          for (var x2 = minX; x2 <= maxX; x2 += stride) {
-            var tt = g.ref(x2, y2);
-            if (g.ownerID(tt) !== sid) continue;
-            if (g.isOceanShore(tt)) shore.push(tt);
-            else if (!g.isBorder(tt)) interior.push(tt);
-          }
-        }
-        // Tiny empires: the strided scan can miss everything, so fall back to
-        // the exact border set.
-        if (!interior.length && !shore.length) {
-          for (var j = 0; j < border.length; j++) {
-            if (g.isOceanShore(border[j])) shore.push(border[j]);
-            else interior.push(border[j]);
-          }
-        }
-
-        self.territory = {
-          at: Date.now(),
-          border: border,
-          interior: shuffle(interior, self.rng),
-          shore: shuffle(shore, self.rng),
-          neutralEdge: neutralEdge,
-          enemyEdge: enemyEdge,
-          enemyTile: enemyTile,
-          bbox: [minX, minY, maxX, maxY],
-        };
+        self.analyzeTerritory(g, me, border);
       })
-      .catch(function () {})
+      .catch(function (e) {
+        OBA.log("warn", "borderTiles failed: " + e);
+      })
       .then(function () {
         self.busy.territory = false;
       });
+  };
+
+  /** Locate our own border tiles by sweeping the map, coarse to fine. */
+  Bot.prototype.scanBorder = function (g, me) {
+    var w = g.width(),
+      h = g.height(),
+      sid = me.smallID();
+    var stride = Math.max(1, Math.round(Math.sqrt((w * h) / 40000)));
+    for (var pass = 0; pass < 5; pass++) {
+      var border = [];
+      for (var y = 0; y < h; y += stride) {
+        for (var x = 0; x < w; x += stride) {
+          var t = g.ref(x, y);
+          if (g.ownerID(t) !== sid) continue;
+          if (g.isBorder(t)) border.push(t);
+        }
+      }
+      if (border.length) return border;
+      if (stride === 1) break;
+      stride = Math.max(1, stride >> 1); // a small empire slips through a coarse net
+    }
+    return [];
+  };
+
+  Bot.prototype.analyzeTerritory = function (g, me, border) {
+    if (!border || !border.length) return;
+    var sid = me.smallID();
+    var minX = Infinity,
+      maxX = -Infinity,
+      minY = Infinity,
+      maxY = -Infinity;
+    for (var b = 0; b < border.length; b++) {
+      var x0 = g.x(border[b]),
+        y0 = g.y(border[b]);
+      if (x0 < minX) minX = x0;
+      if (x0 > maxX) maxX = x0;
+      if (y0 < minY) minY = y0;
+      if (y0 > maxY) maxY = y0;
+    }
+
+    // Who are we actually touching, and how much of our edge faces them?
+    var neutralEdge = 0;
+    var enemyEdge = Object.create(null);
+    var enemyTile = Object.create(null);
+    var sample = border.length > 20000 ? (border.length / 20000) | 0 : 1;
+    for (var i = 0; i < border.length; i += sample) {
+      var t = border[i];
+      var nb = g.neighbors(t);
+      for (var k = 0; k < nb.length; k++) {
+        var nt = nb[k];
+        if (!g.isLand(nt) || g.isImpassable(nt)) continue;
+        var o = g.ownerID(nt);
+        if (o === sid) continue;
+        if (!g.hasOwner(nt)) {
+          neutralEdge++;
+        } else {
+          enemyEdge[o] = (enemyEdge[o] || 0) + 1;
+          if (enemyTile[o] === undefined) enemyTile[o] = t;
+        }
+      }
+    }
+
+    // Interior / shore candidates for construction.
+    var bw = maxX - minX + 1,
+      bh = maxY - minY + 1;
+    var stride = Math.max(1, Math.round(Math.sqrt((bw * bh) / 24000)));
+    var interior = [],
+      shore = [];
+    for (var y2 = minY; y2 <= maxY; y2 += stride) {
+      for (var x2 = minX; x2 <= maxX; x2 += stride) {
+        var tt = g.ref(x2, y2);
+        if (g.ownerID(tt) !== sid) continue;
+        if (g.isOceanShore(tt)) shore.push(tt);
+        else if (!g.isBorder(tt)) interior.push(tt);
+      }
+    }
+    // Tiny empires: the strided scan can miss everything, so fall back to
+    // the border tiles themselves.
+    if (!interior.length && !shore.length) {
+      for (var j = 0; j < border.length; j++) {
+        if (g.isOceanShore(border[j])) shore.push(border[j]);
+        else interior.push(border[j]);
+      }
+    }
+
+    this.territory = {
+      at: Date.now(),
+      border: border,
+      interior: shuffle(interior, this.rng),
+      shore: shuffle(shore, this.rng),
+      neutralEdge: neutralEdge,
+      enemyEdge: enemyEdge,
+      enemyTile: enemyTile,
+      bbox: [minX, minY, maxX, maxY],
+    };
   };
 
   /* ------------------------------------------------------------------ *

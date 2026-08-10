@@ -544,6 +544,130 @@ async function pump(ticks) {
     JSON.stringify(orphan),
   );
 
+  console.log("\n10. older deployments with a thinner GameView");
+  // openbattle.ir lags upstream and its GameView lacks some helpers. Strip
+  // them and confirm the compatibility view derives equivalents rather than
+  // letting a subsystem die on a missing method.
+  const REMOVED = [
+    "isImpassable",
+    "isOceanShore",
+    "isBorder",
+    "hasOwner",
+    "euclideanDistSquared",
+    "isOcean",
+  ];
+  const stripped = Object.create(null);
+  for (const k of Object.keys(game)) stripped[k] = game[k];
+  for (const gone of REMOVED) delete stripped[gone];
+  buildMenu.game = stripped;
+
+  const v = OBA.view();
+  check("compatibility view is built for the stripped GameView", !!v && v.raw === stripped);
+  check(
+    "reports every method it had to replace",
+    REMOVED.every((m) => OBA.state.missing.includes(m)),
+    OBA.state.missing.join(","),
+  );
+  const landTile = cy * W + 40;
+  const shoreTile = (() => {
+    for (let x = W - 1; x >= 0; x--) if (game.isOceanShore(cy * W + x)) return cy * W + x;
+    return -1;
+  })();
+  check("derived isImpassable matches the real one", v.isImpassable(landTile) === game.isImpassable(landTile));
+  check("derived isOceanShore finds the coast", shoreTile >= 0 && v.isOceanShore(shoreTile) === true);
+  check("derived isOceanShore rejects the interior", v.isOceanShore(landTile) === false);
+  check("derived hasOwner matches", v.hasOwner(cy * W + cx) === game.hasOwner(cy * W + cx));
+  check("derived isBorder matches", v.isBorder(shoreTile) === game.isBorder(shoreTile));
+  check(
+    "derived euclideanDistSquared matches",
+    v.euclideanDistSquared(landTile, shoreTile) ===
+      game.euclideanDistSquared(landTile, shoreTile),
+  );
+
+  // The whole point: a spawn scan must now complete instead of throwing.
+  // Hand back an unclaimed map so there is something to spawn onto.
+  const savedOwner = Int32Array.from(owner);
+  owner.fill(0);
+  OBA.state.gameSocket = null;
+  OBA.state.gameWorker = worker;
+  OBA.state.gameType = "Singleplayer";
+  OBA.state.pendingIntents.length = 0;
+  me._spawned = false;
+  game._spawn = true;
+  bot.spawnEvals = 0;
+  bot.spawnPicked = null;
+  bot.next = {};
+  bot.running = true;
+  await pump(12);
+  check(
+    "spawn scan survives the missing helpers",
+    OBA.state.pendingIntents.some((i) => i.type === "spawn"),
+    JSON.stringify(OBA.state.pendingIntents),
+  );
+  check(
+    "no error was logged during the scan",
+    !logs.some((l) => l.level === "error"),
+    logs.filter((l) => l.level === "error").map((l) => l.text).join(" | "),
+  );
+  bot.stop();
+  buildMenu.game = game;
+  owner.set(savedOwner);
+
+  console.log("\n11. a singleplayer game never routes through a stray socket");
+  // A lobby or matchmaking socket can be open when a singleplayer match
+  // starts; its intents must still go to the local worker.
+  OBA.state.gameType = null;
+  const stray = vm.runInContext("new WebSocket('wss://openbattle.ir/lobby')", sandbox);
+  stray.send(JSON.stringify({ type: "join", gameID: "lobby1", username: "me" }));
+  check("a pre-game socket can latch before the match type is known", OBA.state.gameSocket === stray);
+
+  workerCalls.length = 0;
+  OBA.state.pendingIntents.length = 0;
+  worker.postMessage({
+    type: "init",
+    clientID: "me-client",
+    gameStartInfo: { config: { gameType: "Singleplayer" } },
+  });
+  check("starting a match clears the previously latched socket", OBA.state.gameSocket === null);
+  check("the match type is recorded", OBA.state.gameType === "Singleplayer");
+
+  socketCalls.length = 0;
+  const spRoute = OBA.sendIntent({ type: "spawn", tile: 77 });
+  check("singleplayer intents go to the worker, not the socket", spRoute === "local");
+  check("nothing was written to the stray socket", socketCalls.length === 0);
+
+  // Even if the stray socket re-announces itself mid-match, singleplayer wins.
+  stray.send(JSON.stringify({ type: "join", gameID: "lobby1", username: "me" }));
+  check(
+    "a singleplayer match refuses to latch a join-only socket",
+    OBA.state.gameSocket === null,
+  );
+  socketCalls.length = 0;
+  check("still local", OBA.sendIntent({ type: "spawn", tile: 78 }) === "local");
+  check("still nothing on the socket", socketCalls.length === 0);
+
+  console.log("\n12. a build without borderTiles");
+  // Territory analysis must fall back to scanning the map itself.
+  buildMenu.game = game;
+  const savedBorderTiles = me.borderTiles;
+  delete me.borderTiles;
+  me._spawned = true;
+  game._spawn = false;
+  me._troops = 90000;
+  bot.territory = null;
+  bot.next = {};
+  bot.running = true;
+  OBA.state.pendingIntents.length = 0;
+  await pump(40);
+  check("territory is rebuilt without borderTiles", !!bot.territory);
+  check(
+    "and the bot still acts on it",
+    !!bot.territory && bot.territory.border.length > 0 && OBA.state.pendingIntents.length > 0,
+    JSON.stringify(bot.territory && bot.territory.border.length),
+  );
+  bot.stop();
+  me.borderTiles = savedBorderTiles;
+
   console.log(
     "\n" +
       (failures === 0

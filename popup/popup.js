@@ -11,8 +11,12 @@
     chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
       var tab = tabs && tabs[0];
       if (!tab || !tab.id) return;
-      if (!/^https:\/\/([a-z0-9-]+\.)?openbattle\.ir\//.test(tab.url || "")) {
-        stateText.textContent = "این تب openbattle.ir نیست";
+      if (
+        !/^https:\/\/([a-z0-9-]+\.)?(openbattle\.ir|openfront\.io)\//.test(
+          tab.url || "",
+        )
+      ) {
+        stateText.textContent = "این تب بازی نیست";
         return;
       }
       fn(tab);

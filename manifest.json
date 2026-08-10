@@ -18,22 +18,44 @@
       "128": "icons/icon128.png"
     }
   },
-  "permissions": ["storage"],
+  "permissions": [
+    "storage"
+  ],
   "host_permissions": [
     "https://openbattle.ir/*",
-    "https://*.openbattle.ir/*"
+    "https://*.openbattle.ir/*",
+    "https://openfront.io/*",
+    "https://*.openfront.io/*"
   ],
   "content_scripts": [
     {
-      "matches": ["https://openbattle.ir/*", "https://*.openbattle.ir/*"],
-      "js": ["src/page/bridge.js", "src/page/bot.js", "src/page/boot.js"],
+      "matches": [
+        "https://openbattle.ir/*",
+        "https://*.openbattle.ir/*",
+        "https://openfront.io/*",
+        "https://*.openfront.io/*"
+      ],
+      "js": [
+        "src/page/bridge.js",
+        "src/page/bot.js",
+        "src/page/boot.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": false
     },
     {
-      "matches": ["https://openbattle.ir/*", "https://*.openbattle.ir/*"],
-      "js": ["src/ui/settings.js", "src/ui/panel.js", "src/ui/content.js"],
+      "matches": [
+        "https://openbattle.ir/*",
+        "https://*.openbattle.ir/*",
+        "https://openfront.io/*",
+        "https://*.openfront.io/*"
+      ],
+      "js": [
+        "src/ui/settings.js",
+        "src/ui/panel.js",
+        "src/ui/content.js"
+      ],
       "run_at": "document_idle",
       "world": "ISOLATED",
       "all_frames": false

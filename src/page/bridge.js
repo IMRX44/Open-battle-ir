@@ -64,10 +64,12 @@
     gameSocket: null, // WebSocket carrying the in-game transport
     gameWorker: null, // simulation Worker
     clientID: null, // our clientID, read off the worker init message
+    gameType: null, // "Singleplayer" | "Private" | "Public"
     pendingIntents: [], // queued for the next turn (singleplayer path)
     sentIntents: 0,
     lastTransport: null, // "ws" | "local" | null
     workerSeen: false,
+    missing: [], // GameView methods this build does not provide
   };
 
   var listeners = { log: [] };
@@ -122,12 +124,25 @@
       try {
         if (message && typeof message === "object") {
           if (message.type === "init") {
-            // The game's own simulation worker announces itself here.
+            // The game's own simulation worker announces itself here, which is
+            // also the moment a new match begins: forget any socket latched
+            // during the previous game or in the lobby, and let this match's
+            // own traffic re-identify the transport.
             state.gameWorker = worker;
             state.workerSeen = true;
+            state.gameSocket = null;
             if (message.clientID) state.clientID = message.clientID;
+            state.gameType =
+              (message.gameStartInfo &&
+                message.gameStartInfo.config &&
+                message.gameStartInfo.config.gameType) ||
+              null;
             state.pendingIntents.length = 0;
-            log("info", "sim-worker attached");
+            log(
+              "info",
+              "sim-worker attached" +
+                (state.gameType ? " (" + state.gameType + ")" : ""),
+            );
           } else if (
             message.type === "turn" &&
             state.pendingIntents.length > 0 &&
@@ -171,13 +186,17 @@
         if (typeof data === "string" && data.length < 200000) {
           var msg = JSON.parse(data);
           if (msg && typeof msg === "object") {
-            // `intent` and `hash` are only ever produced by the in-game
-            // Transport; `join`/`rejoin` carry a gameID and confirm it too.
-            if (
-              msg.type === "intent" ||
-              msg.type === "hash" ||
-              ((msg.type === "join" || msg.type === "rejoin") && msg.gameID)
-            ) {
+            // `intent` and `hash` come only from the in-game Transport, so
+            // they identify it outright. `join`/`rejoin` with a gameID are a
+            // weaker hint — the matchmaking socket sends a `join` too (without
+            // a gameID), and a singleplayer game has no transport socket at
+            // all, so never let one be latched for it.
+            var sure = msg.type === "intent" || msg.type === "hash";
+            var hint =
+              (msg.type === "join" || msg.type === "rejoin") &&
+              !!msg.gameID &&
+              state.gameType !== "Singleplayer";
+            if (sure || hint) {
               if (state.gameSocket !== this) {
                 state.gameSocket = this;
                 log("info", "game socket attached");
@@ -240,10 +259,199 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * Compatibility view                                                  *
+   *                                                                     *
+   * Deployments lag upstream, and a GameView from an older build is      *
+   * missing some of the terrain and geometry helpers. Rather than let a  *
+   * single absent method throw and take a whole subsystem down, we bind  *
+   * what exists once and derive the rest from primitives that have been  *
+   * there all along (`isLand`, `ownerID`, `x`/`y`, `width`/`height`).     *
+   * ------------------------------------------------------------------ */
+  var VIEW_METHODS = [
+    "width", "height", "ref", "x", "y", "cell",
+    "isValidCoord", "isValidRef",
+    "isLand", "isWater", "isOcean", "isShore", "isShoreline", "isOceanShore",
+    "isImpassable", "terrainType", "magnitude",
+    "ownerID", "hasOwner", "owner", "isBorder", "neighbors",
+    "manhattanDist", "euclideanDistSquared",
+    "players", "playerBySmallID", "player", "myPlayer",
+    "ticks", "inSpawnPhase", "config", "units", "unitsOwnedBy",
+    "numLandTiles",
+  ];
+
+  var TERRAIN_IMPASSABLE = 4; // TerrainType.Impassable
+  var IMPASSABLE_MAGNITUDE = 31;
+
+  var cachedView = null;
+
+  function view() {
+    var game = getGame();
+    if (!game) return null;
+    if (cachedView && cachedView.raw === game) return cachedView;
+    cachedView = buildView(game);
+    return cachedView;
+  }
+
+  function buildView(game) {
+    var v = { raw: game };
+    var missing = [];
+    for (var i = 0; i < VIEW_METHODS.length; i++) {
+      var name = VIEW_METHODS[i];
+      if (typeof game[name] === "function") {
+        v[name] = game[name].bind(game);
+      } else {
+        missing.push(name);
+      }
+    }
+
+    // TileRefs index the terrain buffers row-major, so x/y arithmetic is
+    // enough to rebuild the geometry helpers.
+    if (!v.neighbors) {
+      v.neighbors = function (t) {
+        var w = v.width(),
+          h = v.height(),
+          x = v.x(t),
+          y = v.y(t),
+          out = [];
+        if (x > 0) out.push(t - 1);
+        if (x < w - 1) out.push(t + 1);
+        if (y > 0) out.push(t - w);
+        if (y < h - 1) out.push(t + w);
+        return out;
+      };
+    }
+    if (!v.isValidRef) {
+      v.isValidRef = function (t) {
+        return t >= 0 && t < v.width() * v.height();
+      };
+    }
+    if (!v.isWater) {
+      v.isWater = function (t) {
+        return !v.isLand(t);
+      };
+    }
+    if (!v.isOcean) {
+      // Without the ocean bit a lake reads as ocean. Harmless: every build
+      // that depends on it is re-validated by the game before it is sent.
+      v.isOcean = function (t) {
+        return !v.isLand(t);
+      };
+    }
+    if (!v.isImpassable) {
+      if (v.terrainType) {
+        v.isImpassable = function (t) {
+          return v.terrainType(t) === TERRAIN_IMPASSABLE;
+        };
+      } else if (v.magnitude) {
+        v.isImpassable = function (t) {
+          return v.isLand(t) && v.magnitude(t) === IMPASSABLE_MAGNITUDE;
+        };
+      } else {
+        v.isImpassable = function () {
+          return false;
+        };
+      }
+    }
+    if (!v.isOceanShore) {
+      v.isOceanShore = function (t) {
+        if (!v.isLand(t)) return false;
+        var nb = v.neighbors(t);
+        for (var k = 0; k < nb.length; k++) if (v.isOcean(nb[k])) return true;
+        return false;
+      };
+    }
+    if (!v.isShore) {
+      v.isShore = function (t) {
+        if (!v.isLand(t)) return false;
+        var nb = v.neighbors(t);
+        for (var k = 0; k < nb.length; k++) if (!v.isLand(nb[k])) return true;
+        return false;
+      };
+    }
+    if (!v.hasOwner) {
+      v.hasOwner = function (t) {
+        return v.ownerID(t) !== 0;
+      };
+    }
+    if (!v.isBorder) {
+      v.isBorder = function (t) {
+        var o = v.ownerID(t);
+        var nb = v.neighbors(t);
+        for (var k = 0; k < nb.length; k++)
+          if (v.ownerID(nb[k]) !== o) return true;
+        return false;
+      };
+    }
+    if (!v.euclideanDistSquared) {
+      v.euclideanDistSquared = function (a, b) {
+        var dx = v.x(a) - v.x(b),
+          dy = v.y(a) - v.y(b);
+        return dx * dx + dy * dy;
+      };
+    }
+    if (!v.manhattanDist) {
+      v.manhattanDist = function (a, b) {
+        return Math.abs(v.x(a) - v.x(b)) + Math.abs(v.y(a) - v.y(b));
+      };
+    }
+    var TERRA_NULLIUS = {
+      isPlayer: function () {
+        return false;
+      },
+      smallID: function () {
+        return 0;
+      },
+    };
+    if (!v.playerBySmallID) {
+      v.playerBySmallID = function (sid) {
+        var list = v.players ? v.players() : [];
+        for (var k = 0; k < list.length; k++)
+          if (list[k].smallID() === sid) return list[k];
+        return TERRA_NULLIUS;
+      };
+    }
+    if (!v.owner) {
+      v.owner = function (t) {
+        return v.playerBySmallID(v.ownerID(t));
+      };
+    }
+    if (!v.players) {
+      v.players = function () {
+        return [];
+      };
+    }
+    if (!v.units) {
+      v.units = function () {
+        return [];
+      };
+    }
+    if (!v.isValidCoord) {
+      v.isValidCoord = function (x, y) {
+        return x >= 0 && y >= 0 && x < v.width() && y < v.height();
+      };
+    }
+
+    state.missing = missing;
+    if (missing.length) {
+      log(
+        "warn",
+        "این نسخه‌ی بازی " +
+          missing.length +
+          " متد ندارد؛ جایگزین شد: " +
+          missing.join(", "),
+      );
+    }
+    return v;
+  }
+
+  /* ------------------------------------------------------------------ *
    * Sending intents                                                     *
    * ------------------------------------------------------------------ */
   function sendIntent(intent) {
-    var ws = state.gameSocket;
+    // A singleplayer match is simulated entirely in the worker and has no
+    // transport socket, so never let a stray socket swallow the intent.
+    var localOnly = state.gameType === "Singleplayer" && state.gameWorker;
+    var ws = localOnly ? null : state.gameSocket;
     if (ws && ws.readyState === 1 /* OPEN */) {
       try {
         ws.send(JSON.stringify({ type: "intent", intent: intent }));
@@ -280,7 +488,7 @@
    */
   function quickBuild(unitType, screenX, screenY, opts) {
     opts = opts || {};
-    var game = getGame();
+    var game = view();
     var th = getTransform();
     var me = myPlayer();
     if (!game || !th) return Promise.resolve({ ok: false, reason: "no_game" });
@@ -441,6 +649,7 @@
       listeners.log.push(fn);
     },
     getGame: getGame,
+    view: view,
     getTransform: getTransform,
     getUiState: getUiState,
     myPlayer: myPlayer,
