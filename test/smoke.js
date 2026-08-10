@@ -668,6 +668,112 @@ async function pump(ticks) {
   bot.stop();
   me.borderTiles = savedBorderTiles;
 
+  console.log("\n13. god mode — attrition maths");
+  // Per tile the attacker pays within(D/T, 0.6, 2) * mag * 0.8, so an attack
+  // launched below ~1.7x the defender's whole army costs multiples of the
+  // troops for the same ground. God mode must refuse those fights outright
+  // and size the ones it takes to the target, not to its own barracks.
+  buildMenu.game = game;
+  OBA.sendIntent = (intent) => {
+    sent.push(intent);
+    return "test";
+  };
+  bot.setConfig({ preset: "god" });
+  check("god preset uses the attrition gate", bot.cfg.attackEfficiency >= 1.6);
+
+  me._spawned = true;
+  game._spawn = false;
+  bot.territory = null;
+  bot.next = {};
+  bot.running = true;
+
+  // A neighbour just out of reach: we hold 90k, they hold 70k. The old
+  // threshold (1.35) would have attacked; the maths says wait.
+  foe._troops = 70000;
+  me._troops = 90000;
+  me._in = [];
+  me._out = [];
+  sent.length = 0;
+  await pump(50);
+  const rash = sent.filter((i) => i.type === "attack" && i.targetID === "foe");
+  check(
+    "refuses a fight it cannot win cheaply",
+    rash.length === 0,
+    JSON.stringify(rash),
+  );
+
+  // Now they are weak enough that the attack is efficient.
+  foe._troops = 12000;
+  me._troops = 200000;
+  bot.next = {};
+  bot.territory = null;
+  sent.length = 0;
+  await pump(50);
+  const strike2 = sent.find((i) => i.type === "attack" && i.targetID === "foe");
+  check("attacks once the maths clears", !!strike2, JSON.stringify(sent.slice(0, 4)));
+  if (strike2) {
+    check(
+      "commits enough to sit at minimum attrition",
+      strike2.troops >= foe._troops * 1.6,
+      "sent " + strike2.troops + " vs needed " + foe._troops * 1.7,
+    );
+    check(
+      "but does not empty the barracks for a small target",
+      strike2.troops < me._troops * 0.5,
+      "sent " + strike2.troops + " of " + me._troops,
+    );
+  }
+
+  console.log("\n14. god mode — garrison and pressure");
+  // Troops under an incoming attack must stay home.
+  me._troops = 200000;
+  me._in = [{ attackerID: 2, targetID: 1, troops: 150000, id: "a", retreating: false }];
+  const guarded = bot.spendable(bot.lastView || OBA.view(), me);
+  check(
+    "a large incoming attack locks down the budget",
+    guarded < 200000 * 0.4,
+    "spendable " + Math.round(guarded),
+  );
+  me._in = [];
+  const relaxed = bot.spendable(OBA.view(), me);
+  check("and frees it again once the threat passes", relaxed > guarded);
+
+  console.log("\n15. god mode — island hunting");
+  // Carve an unclaimed island into the ocean, well clear of the mainland.
+  const isleX = 135,
+    isleY = 25;
+  for (let y = isleY - 5; y <= isleY + 5; y++)
+    for (let x = isleX - 5; x <= isleX + 5; x++) {
+      const i = y * W + x;
+      LAND[i] = 1;
+      OCEAN[i] = 0;
+    }
+  me._troops = 300000;
+  me._out = [];
+  bot.next = {};
+  bot.territory = null;
+  sent.length = 0;
+  bot.running = true;
+  await pump(60);
+  check(
+    "spots the unclaimed landmass",
+    !!bot.islands && bot.islands.targets.length > 0,
+    JSON.stringify(bot.islands && bot.islands.targets.length),
+  );
+  const landing = sent.find((i) => i.type === "boat");
+  check("sends a transport to it", !!landing, JSON.stringify(sent.map((s) => s.type)));
+  if (landing) {
+    const lx = landing.dst % W,
+      ly = (landing.dst / W) | 0;
+    check(
+      "lands on the island, not back home",
+      Math.abs(lx - isleX) <= 6 && Math.abs(ly - isleY) <= 6,
+      "dst " + lx + "," + ly,
+    );
+    check("does not ship the whole army out", landing.troops < me._troops * 0.4);
+  }
+  bot.stop();
+
   console.log(
     "\n" +
       (failures === 0

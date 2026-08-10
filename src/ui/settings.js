@@ -53,28 +53,46 @@
     shortcuts: DEFAULT_SHORTCUTS,
     panel: { open: true, tab: "keys", x: null, y: null },
     bot: {
-      preset: "balanced",
-      aggression: 0.6,
+      preset: "god",
+      aggression: 0.85,
       attackThreshold: 1.35,
-      attackRatio: 0.55,
-      expandRatio: 0.85,
-      reserve: 0.12,
+      attackEfficiency: 1.7,
+      attackRatio: 0.9,
+      expandRatio: 0.92,
+      reserve: 0.1,
       autoSpawn: true,
       economy: true,
       defense: true,
       warships: true,
       nukes: true,
       boats: true,
+      islands: true,
+      distrust: true,
       diplomacy: true,
-      betray: false,
+      betray: true,
     },
   };
 
+  var PRESETS = ["god", "balanced", "aggressive", "economic", "turtle"];
+
   var PRESET_FA = {
+    god: "خدایی",
     balanced: "متعادل",
     aggressive: "تهاجمی",
     economic: "اقتصادی",
     turtle: "دفاعی",
+  };
+
+  var PRESET_HINT = {
+    god:
+      "قوی‌ترین حالت. فقط وقتی حمله می‌کند که ریاضیِ نبرد به نفعش باشد، اندازه‌ی هر حمله را " +
+      "روی کمترین تلفات تنظیم می‌کند، ارتش را روی سقف نگه نمی‌دارد تا بازتولید نخوابد، " +
+      "جزیره‌های بی‌صاحب را با کشتی می‌گیرد، مرز متحد را هم پاسگاه می‌زند و اتحاد را " +
+      "یک تایمر می‌بیند نه یک قول.",
+    balanced: "گسترش، اقتصاد و جنگ متوازن.",
+    aggressive: "زودتر و با نیروی بیشتر حمله می‌کند.",
+    economic: "بیشتر می‌سازد، دیرتر می‌جنگد.",
+    turtle: "ذخیره‌ی نیروی بالا، پاسگاه و پدافند زیاد.",
   };
 
   var state = null;
@@ -176,7 +194,9 @@
     UNITS: UNITS,
     DEFAULTS: DEFAULTS,
     DEFAULT_SHORTCUTS: DEFAULT_SHORTCUTS,
+    PRESETS: PRESETS,
     PRESET_FA: PRESET_FA,
+    PRESET_HINT: PRESET_HINT,
     load: load,
     save: save,
     get: get,

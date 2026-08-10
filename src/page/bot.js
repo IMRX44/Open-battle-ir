@@ -35,6 +35,18 @@
     reserve: 0.12, //  share of troops never committed
     maxConcurrentAttacks: 2,
 
+    // Attrition. Per conquered tile the attacker pays
+    //   within(D / T, 0.6, 2) * mag * 0.8   (+ a smaller density term)
+    // where D is the defender's whole army and T the troops committed. The
+    // multiplier bottoms out at 0.6 once T >= D / 0.6, so an attack launched
+    // with less than ~1.7x the defender's army pays up to three times as many
+    // troops for exactly the same ground. `attackEfficiency` is that ratio:
+    // below it, waiting is strictly better than attacking.
+    attackEfficiency: 0, //  0 = use the old attackThreshold behaviour
+    // Regeneration is 10 + troops^0.73/4 scaled by (1 - troops/max), so an
+    // army parked at the cap earns nothing. Spend down to keep it flowing.
+    troopBandLow: 0.35,
+
     // Toggles
     autoSpawn: true,
     economy: true,
@@ -42,6 +54,8 @@
     warships: true,
     nukes: true,
     boats: true,
+    islands: false, //  hunt unclaimed islands by sea, not just when boxed in
+    distrust: false, //  fortify allied borders and let doomed pacts lapse
     diplomacy: true,
     betray: false, //  break alliances of opportunity
 
@@ -87,6 +101,33 @@
       maxSams: 12,
       maxConcurrentAttacks: 1,
     },
+
+    // Plays the numbers rather than the mood. It only opens a fight it can
+    // win at minimum attrition, sizes each attack to what the target actually
+    // costs instead of emptying the barracks, keeps its army off the
+    // regeneration ceiling, takes islands by sea for free ground, treats
+    // defence posts as the cheapest force multiplier on the board, and treats
+    // an alliance as a timer rather than a promise.
+    god: {
+      aggression: 0.85,
+      attackEfficiency: 1.7,
+      attackRatio: 0.9,
+      expandRatio: 0.92,
+      reserve: 0.1,
+      troopBandLow: 0.3,
+      // Attacks on one target merge into a single stack anyway, and a bigger
+      // stack conquers faster, so splitting effort is strictly worse.
+      maxConcurrentAttacks: 1,
+      islands: true,
+      distrust: true,
+      betray: true,
+      maxCities: 90,
+      maxPorts: 22,
+      maxFactories: 20,
+      maxDefensePosts: 40,
+      maxSams: 14,
+      maxWarships: 12,
+    },
   };
 
   // Cadence, in game ticks (1 tick = 100 ms).
@@ -99,6 +140,8 @@
     defense: 45,
     navy: 40,
     boats: 50,
+    islandScan: 170,
+    islands: 55,
     nuke: 45,
     diplomacy: 55,
   };
@@ -156,6 +199,7 @@
     this.busy = {}; // subsystem -> in-flight async guard
 
     this.territory = null; // { border, interior, shore, enemyEdge, bbox, at }
+    this.islands = null; // { at, targets: [{ free, shores }] }
     this.spawnEvals = 0;
     this.spawnPicked = null;
     this.spawnScore = 0;
@@ -181,6 +225,7 @@
     this.spawnPicked = null;
     this.spawnScore = 0;
     this.territory = null;
+    this.islands = null;
     var self = this;
     this.timer = setInterval(function () {
       try {
@@ -198,6 +243,60 @@
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     OBA.log("info", "ربات متوقف شد");
+  };
+
+  /* ------------------------------------------------------------------ *
+   * Troop budgeting                                                     *
+   *                                                                     *
+   * Troops committed to an attack leave `troops()`, which both speeds    *
+   * regeneration and thins the home defence — the defender's whole army  *
+   * is what the combat maths charges against. So every commitment is     *
+   * taken out of a budget, never out of "whatever we happen to have".    *
+   * ------------------------------------------------------------------ */
+
+  /** Total troops currently bearing down on us. */
+  Bot.prototype.pressure = function (me) {
+    var inc = me.incomingAttacks() || [];
+    var sum = 0;
+    for (var i = 0; i < inc.length; i++) sum += inc[i].troops || 0;
+    return sum;
+  };
+
+  /** Troops that must stay home no matter how good the opportunity looks. */
+  Bot.prototype.reserveTroops = function (g, me) {
+    var max = this.maxTroops(g, me);
+    var frac = this.cfg.reserve;
+    var terr = this.territory;
+    var hostile = false;
+    if (terr) {
+      for (var sid in terr.enemyEdge) {
+        var p = g.playerBySmallID(+sid);
+        if (!p || !p.isPlayer || !p.isPlayer()) continue;
+        var friendly = false;
+        try {
+          friendly = me.isFriendly(p);
+        } catch (e) {}
+        if (!friendly) {
+          hostile = true;
+          break;
+        }
+      }
+    }
+    // A quiet interior needs far less garrison than a contested one.
+    if (hostile) frac += 0.16;
+    return Math.max(max * frac, this.pressure(me) * 1.5);
+  };
+
+  Bot.prototype.spendable = function (g, me) {
+    return Math.max(0, me.troops() - this.reserveTroops(g, me));
+  };
+
+  Bot.prototype.maxTroops = function (g, me) {
+    try {
+      return g.config().maxTroops(me) || 1;
+    } catch (e) {
+      return Math.max(1, me.troops());
+    }
   };
 
   Bot.prototype.due = function (key, tick) {
@@ -247,6 +346,16 @@
     if (this.cfg.defense && this.due("defense", tick)) this.doDefense(g, me);
     if (this.cfg.warships && this.due("navy", tick)) this.doNavy(g, me);
     if (this.cfg.nukes && this.due("nuke", tick)) this.doNukes(g, me);
+    if (this.cfg.islands) {
+      if (this.due("islandScan", tick)) {
+        try {
+          this.refreshIslands(g, me);
+        } catch (e) {
+          OBA.log("error", "island scan failed: " + e);
+        }
+      }
+      if (this.due("islands", tick)) this.doIslands(g, me);
+    }
     if (this.cfg.boats && this.due("boats", tick)) this.doBoats(g, me);
     if (this.cfg.diplomacy && this.due("diplomacy", tick))
       this.doDiplomacy(g, me, tick);
@@ -608,11 +717,25 @@
     var terr = this.territory;
     if (!terr || terr.neutralEdge <= 0) return;
 
+    var cfg = this.cfg;
     var troops = me.troops();
-    var max = 1;
-    try {
-      max = g.config().maxTroops(me);
-    } catch (e) {}
+    var max = this.maxTroops(g, me);
+
+    if (cfg.attackEfficiency > 0) {
+      // A neutral tile costs a flat mag/5 troops whatever the stack size, but
+      // the conquest rate rises with it (the per-tile budget charge bottoms
+      // out at 5 once the stack is large), and same-target attacks merge. So
+      // topping the wave up beats holding troops back — the only thing worth
+      // keeping is the garrison.
+      if (troops < max * cfg.troopBandLow) return;
+      var send = Math.floor(this.spendable(g, me) * cfg.expandRatio);
+      if (send < 1) return;
+      OBA.sendIntent({ type: "attack", targetID: null, troops: send });
+      this.stats.actions++;
+      this.stats.attacks++;
+      return;
+    }
+
     if (troops < max * 0.18) return; // let the army rebuild
 
     // Don't pile a second wave on top of a healthy ongoing land grab.
@@ -623,9 +746,9 @@
       if (isNeutral && out[i].troops > troops * 0.12) return;
     }
 
-    var send = Math.floor(troops * this.cfg.expandRatio);
-    if (send < 1) return;
-    OBA.sendIntent({ type: "attack", targetID: null, troops: send });
+    var amount = Math.floor(troops * cfg.expandRatio);
+    if (amount < 1) return;
+    OBA.sendIntent({ type: "attack", targetID: null, troops: amount });
     this.stats.actions++;
     this.stats.attacks++;
   };
@@ -682,6 +805,8 @@
     // While there is still free land, prefer taking it over starting a war.
     if (terr.neutralEdge > 40 && cfg.aggression < 0.8) return;
 
+    if (cfg.attackEfficiency > 0) return this.doAttackByMath(g, me, attacking);
+
     var best = null;
     for (var sidStr in terr.enemyEdge) {
       var sid = +sidStr;
@@ -719,6 +844,114 @@
     this.stats.actions++;
     this.stats.attacks++;
     OBA.log("info", "حمله به " + safeName(best.p));
+  };
+
+  /**
+   * Attack selection that respects the combat maths instead of the mood.
+   *
+   * A war is only opened when the budget covers `attackEfficiency` times the
+   * target's whole army — the point where per-tile attrition bottoms out.
+   * Below that the same ground costs up to three times as many troops, so not
+   * attacking is strictly better than attacking badly.
+   *
+   * Among targets that clear the bar, the cheapest ground wins: a thin
+   * garrison spread over many tiles, no defence posts on the contested edge
+   * (they multiply defence fivefold within thirty tiles), and a wide shared
+   * border, since the conquest rate scales with frontage.
+   */
+  Bot.prototype.doAttackByMath = function (g, me, attacking) {
+    var cfg = this.cfg;
+    var terr = this.territory;
+    var budget = this.spendable(g, me);
+    if (budget < 1) return;
+
+    var myTroops = me.troops();
+    var best = null;
+
+    for (var sidStr in terr.enemyEdge) {
+      var sid = +sidStr;
+      if (attacking[sid]) continue;
+      var p = g.playerBySmallID(sid);
+      if (!p || !p.isPlayer || !p.isPlayer() || !p.isAlive()) continue;
+
+      var friendly = false;
+      try {
+        friendly = me.isFriendly(p) || p.isFriendly(me);
+      } catch (e) {}
+
+      var D = Math.max(1, p.troops());
+      var needed = D * cfg.attackEfficiency;
+      // The one hard gate: if we cannot bring enough to fight cheaply, we
+      // do not fight at all.
+      if (budget < needed) continue;
+
+      if (friendly) {
+        // Breaking a pact costs half defence and a fifth of our speed for
+        // thirty seconds — cheap, but only worth it for a target we can
+        // overrun inside that window.
+        if (!cfg.betray) continue;
+        if (D > myTroops * 0.35) continue;
+      }
+
+      var tiles = Math.max(1, p.numTilesOwned());
+      var density = D / tiles; // troops defending each tile
+      var edge = terr.enemyEdge[sid];
+
+      var fortified = this.borderIsFortified(g, me, p, terr.enemyTile[sid]);
+
+      var score =
+        // Soft targets first: attrition per tile tracks defender density.
+        40 / (1 + density) +
+        // Frontage drives the conquest rate.
+        Math.min(edge, 600) * 0.03 +
+        // Overkill capacity means we finish before they can regenerate.
+        Math.min(budget / needed, 4) * 6 +
+        (p.type() === PT.Bot ? 6 : 0) +
+        (p.isTraitor && p.isTraitor() ? 5 : 0) +
+        // A player already collapsing is free territory.
+        (tiles < 400 ? 8 : 0) -
+        // Five times the defence in a thirty-tile radius. Go around it.
+        (fortified ? 25 : 0) -
+        (friendly ? 10 : 0);
+
+      if (!best || score > best.score)
+        best = { p: p, score: score, needed: needed, friendly: friendly };
+    }
+    if (!best) return;
+
+    // Send what the target costs plus a margin, not the whole army: the
+    // surplus defends the homeland and keeps regeneration running.
+    var send = Math.floor(Math.min(budget, best.needed * 1.15));
+    if (send < 1) return;
+    OBA.sendIntent({ type: "attack", targetID: best.p.id(), troops: send });
+    this.stats.actions++;
+    this.stats.attacks++;
+    OBA.log(
+      best.friendly ? "warn" : "info",
+      (best.friendly ? "شکستن اتحاد و حمله به " : "حمله به ") +
+        safeName(best.p) +
+        " با " +
+        Math.round(send / 1000) +
+        "K نیرو",
+    );
+  };
+
+  /** Does the target keep a defence post covering the edge we would cross? */
+  Bot.prototype.borderIsFortified = function (g, me, target, edgeTile) {
+    if (edgeTile === undefined || edgeTile === null) return false;
+    var posts;
+    try {
+      posts = target.units(U.DefensePost);
+    } catch (e) {
+      return false;
+    }
+    var R2 = 32 * 32; // defencePostRange is 30
+    for (var i = 0; i < posts.length; i++) {
+      try {
+        if (g.euclideanDistSquared(posts[i].tile(), edgeTile) <= R2) return true;
+      } catch (e) {}
+    }
+    return false;
   };
 
   function safeName(p) {
@@ -877,7 +1110,10 @@
     var posts = liveCount(me, U.DefensePost);
     var sams = liveCount(me, U.SAMLauncher);
 
-    // How much of our border faces someone we are not friendly with?
+    // How much of our border faces someone who might come through it?
+    // An alliance runs on a timer, not on goodwill, so a border with an ally
+    // is discounted rather than ignored — the post is already standing when
+    // the pact lapses.
     var hot = 0;
     var hotTiles = [];
     for (var sidStr in terr.enemyEdge) {
@@ -887,13 +1123,17 @@
       try {
         friendly = me.isFriendly(p);
       } catch (e) {}
-      if (friendly) continue;
-      hot += terr.enemyEdge[sidStr];
+      if (friendly && !cfg.distrust) continue;
+      hot += terr.enemyEdge[sidStr] * (friendly ? 0.5 : 1);
       if (terr.enemyTile[sidStr] !== undefined)
         hotTiles.push(terr.enemyTile[sidStr]);
     }
 
-    var postTarget = clamp(Math.floor(hot / 70), 0, cfg.maxDefensePosts);
+    // Five times the defence and a third of the attacker's speed within
+    // thirty tiles, for the price of a small city. Nothing else on the board
+    // trades that well, so build them densely along contested frontage.
+    var perPost = cfg.attackEfficiency > 0 ? 40 : 70;
+    var postTarget = clamp(Math.floor(hot / perPost), 0, cfg.maxDefensePosts);
     if (posts < postTarget && hotTiles.length) {
       // Defence posts belong on the contested edge, not in the interior.
       var pool = hotTiles.concat(terr.border.slice(0, 400));
@@ -957,6 +1197,156 @@
    * Only relevant when we are boxed in — an island start, or every land  *
    * border already closed off by an ally.                                *
    * ------------------------------------------------------------------ */
+  /**
+   * Find landmasses we have no foothold on.
+   *
+   * The map is reduced to a coarse grid, land cells are flood-filled into
+   * connected components, and any component we own nothing on but that still
+   * has unclaimed coast is a free expansion: ground nobody is contesting, and
+   * coastline for more ports. Land expansion can never reach it, so this is
+   * the only way that territory is ever taken.
+   */
+  Bot.prototype.refreshIslands = function (g, me) {
+    var w = g.width(),
+      h = g.height(),
+      C = 8;
+    var gw = Math.ceil(w / C),
+      gh = Math.ceil(h / C),
+      n = gw * gh;
+    var land = new Uint16Array(n);
+    var free = new Uint16Array(n);
+    var mine = new Uint16Array(n);
+    var freeShore = new Int32Array(n);
+    freeShore.fill(-1);
+
+    var sid = me.smallID();
+    var step = w * h > 1200000 ? 2 : 1;
+
+    for (var y = 0; y < h; y += step) {
+      var row = ((y / C) | 0) * gw;
+      for (var x = 0; x < w; x += step) {
+        var t = g.ref(x, y);
+        if (!g.isLand(t) || g.isImpassable(t)) continue;
+        var ci = row + ((x / C) | 0);
+        land[ci]++;
+        if (g.ownerID(t) === sid) {
+          mine[ci]++;
+        } else if (!g.hasOwner(t)) {
+          free[ci]++;
+          if (freeShore[ci] < 0 && g.isOceanShore(t)) freeShore[ci] = t;
+        }
+      }
+    }
+
+    // Flood fill land cells into components (8-connected: a diagonal land
+    // bridge still walks).
+    var comp = new Int32Array(n);
+    comp.fill(-1);
+    var comps = [];
+    var stack = [];
+    for (var seed = 0; seed < n; seed++) {
+      if (land[seed] === 0 || comp[seed] !== -1) continue;
+      var id = comps.length;
+      var rec = { free: 0, mine: 0, land: 0, shores: [] };
+      comps.push(rec);
+      comp[seed] = id;
+      stack.length = 0;
+      stack.push(seed);
+      while (stack.length) {
+        var ci2 = stack.pop();
+        rec.land += land[ci2];
+        rec.free += free[ci2];
+        rec.mine += mine[ci2];
+        if (freeShore[ci2] >= 0 && rec.shores.length < 64)
+          rec.shores.push(freeShore[ci2]);
+        var cx = ci2 % gw,
+          cy = (ci2 / gw) | 0;
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            var nx = cx + dx,
+              ny = cy + dy;
+            if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+            var k = ny * gw + nx;
+            if (land[k] === 0 || comp[k] !== -1) continue;
+            comp[k] = id;
+            stack.push(k);
+          }
+        }
+      }
+    }
+
+    // Worth a landing: nothing of ours on it, real room, and a beach.
+    var minFree = Math.max(12, (60 / (step * step)) | 0);
+    var targets = [];
+    for (var c = 0; c < comps.length; c++) {
+      var r = comps[c];
+      if (r.mine > 0 || r.free < minFree || !r.shores.length) continue;
+      targets.push({ free: r.free, shores: r.shores });
+    }
+    targets.sort(function (a, b) {
+      return b.free - a.free;
+    });
+    this.islands = { at: this.lastTick, targets: targets.slice(0, 12) };
+    if (targets.length)
+      OBA.log(
+        "info",
+        targets.length + " سرزمین بی‌صاحب برای پیاده‌شدن پیدا شد",
+      );
+  };
+
+  /** Pick the closest beach on an unclaimed landmass and land on it. */
+  Bot.prototype.doIslands = function (g, me) {
+    if (this.busy.boats) return;
+    var terr = this.territory;
+    if (!terr || !terr.shore.length) return;
+    if (!this.islands || !this.islands.targets.length) return;
+
+    // Three transports in flight is the hard cap.
+    var afloat = 0;
+    try {
+      afloat = me.units(U.TransportShip).length;
+    } catch (e) {}
+    if (afloat >= 3) return;
+
+    var budget = this.spendable(g, me);
+    var max = this.maxTroops(g, me);
+    if (budget < max * 0.12) return;
+
+    var origin = terr.shore[(this.rng() * terr.shore.length) | 0];
+    var best = null;
+    for (var i = 0; i < this.islands.targets.length; i++) {
+      var isle = this.islands.targets[i];
+      for (var k = 0; k < isle.shores.length; k++) {
+        var t = isle.shores[k];
+        if (g.hasOwner(t)) continue; // taken since the last scan
+        var d = g.euclideanDistSquared(origin, t);
+        // Bigger islands justify a longer crossing.
+        var value = isle.free * 40 - d;
+        if (!best || value > best.value) best = { tile: t, value: value };
+      }
+    }
+    if (!best) return;
+
+    this.busy.boats = true;
+    var self = this;
+    var landing = best.tile;
+    me.bestTransportShipSpawn(landing)
+      .then(function (spawn) {
+        if (!self.running) return;
+        if (spawn === false || spawn === undefined || spawn === null) return;
+        var send = Math.floor(Math.min(budget * 0.35, max * 0.25));
+        if (send < 1) return;
+        OBA.sendIntent({ type: "boat", troops: send, dst: landing });
+        self.stats.actions++;
+        OBA.log("good", "پیاده‌شدن روی سرزمین بی‌صاحب");
+      })
+      .catch(function () {})
+      .then(function () {
+        self.busy.boats = false;
+      });
+  };
+
   Bot.prototype.doBoats = function (g, me) {
     if (this.busy.boats) return;
     var terr = this.territory;
@@ -1159,7 +1549,14 @@
         var out = me.outgoingAttacks() || [];
         for (var k = 0; k < out.length; k++)
           if (out[k].targetID === p.smallID()) busyWith = true;
-        if (!busyWith && !pending) pending = p;
+        if (busyWith) continue;
+        // A neighbour we could already overrun cheaply is territory, not a
+        // partner — signing with them only locks the ground away.
+        if (cfg.distrust && terr && terr.enemyEdge[p.smallID()]) {
+          var cost = Math.max(1, p.troops()) * (cfg.attackEfficiency || 1.7);
+          if (this.spendable(g, me) >= cost) continue;
+        }
+        if (!pending) pending = p;
         continue;
       }
 

@@ -205,7 +205,19 @@
 }
 
 /* ----------------------------- chips ------------------------------- */
-.chips { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; margin-bottom: 12px; }
+.chips { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; margin-bottom: 8px; }
+.chip.god { grid-column: 1 / -1; letter-spacing: .4px; }
+.chip.god::before { content: "★ "; }
+.chip.god.active {
+  border-color: rgba(251,191,36,.6);
+  background: linear-gradient(130deg, rgba(251,191,36,.26), rgba(244,63,94,.2));
+  color: #ffe7b0;
+}
+.hint {
+  font-size: 10.5px; line-height: 1.75; color: var(--muted);
+  background: var(--bg-soft); border: 1px solid var(--line);
+  border-radius: 10px; padding: 8px 10px; margin-bottom: 12px;
+}
 .chip {
   padding: 7px 0; text-align: center; font-size: 11.5px; font-weight: 600;
   border-radius: 9px; cursor: pointer; color: var(--muted);
@@ -344,14 +356,19 @@
 
         <div class="sec">سبک بازی</div>
         <div class="chips" id="presets"></div>
+        <div class="hint" id="presetHint"></div>
 
         <div class="sec">تنظیم دقیق</div>
         <div class="slider" data-key="aggression">
           <div class="lbl"><span>میزان تهاجم</span><b>0.60</b></div>
           <input type="range" min="0" max="1" step="0.05">
         </div>
+        <div class="slider" data-key="attackEfficiency">
+          <div class="lbl"><span>برتری لازم برای حمله (کمترین تلفات)</span><b>1.70</b></div>
+          <input type="range" min="1.2" max="3" step="0.05">
+        </div>
         <div class="slider" data-key="attackThreshold">
-          <div class="lbl"><span>حداقل برتری برای حمله</span><b>1.35</b></div>
+          <div class="lbl"><span>حداقل برتری برای حمله (حالت ساده)</span><b>1.35</b></div>
           <input type="range" min="1" max="3" step="0.05">
         </div>
         <div class="slider" data-key="attackRatio">
@@ -391,8 +408,10 @@
     { key: "defense", fa: "دفاع (پاسگاه، پدافند)", icon: "🛡️" },
     { key: "warships", fa: "ناوگان جنگی", icon: "🚢" },
     { key: "boats", fa: "حمله دریایی", icon: "⛵" },
+    { key: "islands", fa: "گرفتن جزیره‌های بی‌صاحب", icon: "🏝️" },
     { key: "nukes", fa: "سلاح هسته‌ای", icon: "☢️" },
     { key: "diplomacy", fa: "اتحاد و دیپلماسی", icon: "🤝" },
+    { key: "distrust", fa: "اتحاد بله، اعتماد نه", icon: "🕵️" },
     { key: "betray", fa: "شکستن اتحاد در فرصت مناسب", icon: "🗡️" },
   ];
 
@@ -455,9 +474,9 @@
   function buildPresets() {
     var host = $("#presets");
     host.innerHTML = "";
-    ["balanced", "aggressive", "economic", "turtle"].forEach(function (p) {
+    S.PRESETS.forEach(function (p) {
       var b = document.createElement("div");
-      b.className = "chip";
+      b.className = "chip" + (p === "god" ? " god" : "");
       b.dataset.preset = p;
       b.textContent = S.PRESET_FA[p] || p;
       host.appendChild(b);
@@ -659,6 +678,7 @@
     shadow.querySelectorAll(".chip").forEach(function (c) {
       c.classList.toggle("active", c.dataset.preset === s.bot.preset);
     });
+    $("#presetHint").textContent = S.PRESET_HINT[s.bot.preset] || "";
     shadow.querySelectorAll("[data-bot]").forEach(function (sw) {
       sw.classList.toggle("on", !!s.bot[sw.dataset.bot]);
     });

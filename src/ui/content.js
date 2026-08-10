@@ -181,6 +181,7 @@
       preset: b.preset,
       aggression: b.aggression,
       attackThreshold: b.attackThreshold,
+      attackEfficiency: b.attackEfficiency,
       attackRatio: b.attackRatio,
       expandRatio: b.expandRatio,
       reserve: b.reserve,
@@ -190,6 +191,8 @@
       warships: b.warships,
       nukes: b.nukes,
       boats: b.boats,
+      islands: b.islands,
+      distrust: b.distrust,
       diplomacy: b.diplomacy,
       betray: b.betray,
     };

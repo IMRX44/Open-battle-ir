@@ -69,10 +69,35 @@
 
 | سبک | توضیح |
 | --- | --- |
-| متعادل | پیش‌فرض؛ گسترش و اقتصاد و جنگ متوازن |
+| **خدایی** ★ | پیش‌فرض و قوی‌ترین حالت — پایین‌تر توضیح داده شده |
+| متعادل | گسترش و اقتصاد و جنگ متوازن |
 | تهاجمی | زودتر و با نیروی بیشتر حمله می‌کند |
 | اقتصادی | بیشتر می‌سازد، دیرتر می‌جنگد |
 | دفاعی | ذخیره‌ی نیروی بالا، پاسگاه و پدافند زیاد |
+
+### حالت خدایی
+
+سبک‌های دیگر با «حس» بازی می‌کنند. این یکی با ریاضیِ خودِ بازی بازی می‌کند:
+
+- **دیگر سرباز حرام نمی‌کند.** در هر کاشی که فتح می‌شود، مهاجم به اندازه‌ی
+  `within(D/T, 0.6, 2) × mag × 0.8` سرباز می‌دهد؛ `D` کل ارتش مدافع و `T` نیرویی که فرستاده‌ای.
+  این ضریب وقتی `T` از حدود **۱٫۷ برابر کل ارتش حریف** رد شود به کف می‌رسد. پایین‌تر از آن،
+  همان زمین تا **سه برابر** سرباز می‌خورد. پس یا با کف تلفات حمله می‌کند، یا اصلاً حمله نمی‌کند.
+  (سبک‌های دیگر با ۱٫۳۵ برابرِ *کل* نیرو شرط می‌گذارند و بعد فقط ۵۵٪ می‌فرستند — یعنی دقیقاً
+  در بدترین ناحیه‌ی فرسایش. همان چیزی که آدم را عصبی می‌کند.)
+- **اندازه‌ی حمله به حریف بستگی دارد، نه به پادگان خودش.** دقیقاً همان‌قدر که لازم است
+  می‌فرستد و بقیه را برای دفاع نگه می‌دارد.
+- **ارتش را روی سقف نگه نمی‌دارد.** بازتولید نیرو `(1 - troops/max)` است، یعنی ارتشِ پر
+  هیچ درآمدی ندارد. پس مدام خرج می‌کند تا جریان قطع نشود.
+- **پادگان پویا.** هرچه حمله‌ی ورودی بیشتر باشد، بودجه‌ی تهاجمی کمتر می‌شود.
+- **جزیره می‌گیرد.** نقشه را به مؤلفه‌های خشکیِ به‌هم‌پیوسته تقسیم می‌کند و هر تکه‌ای که
+  هیچ چیزی از ما رویش نیست و هنوز ساحل بی‌صاحب دارد، هدف پیاده‌شدن می‌شود. زمینی که
+  از راه خشکی هیچ‌وقت به آن نمی‌رسی.
+- **پاسگاه دفاعی را جدی می‌گیرد.** ×۵ قدرت دفاعی در شعاع ۳۰ کاشی با قیمت یک شهر کوچک.
+  هم خودش متراکم می‌سازد، هم به مرزی که حریف پاسگاه دارد حمله نمی‌کند و دور می‌زند.
+- **اتحاد بله، اعتماد نه.** مرز متحد را هم پاسگاه می‌زند، با همسایه‌ای که همین حالا
+  می‌توانست بخوردش پیمان نمی‌بندد، و چون جریمه‌ی خیانت فقط ۳۰ ثانیه (نصف دفاع) است،
+  وقتی حساب‌وکتاب جواب بدهد پیمان را می‌شکند.
 
 زیر آن‌ها لغزنده‌های دقیق هست (میزان تهاجم، حداقل برتری برای حمله، سهم نیرو، ذخیره) و کلیدهای روشن/خاموش برای هر بخش.
 
@@ -124,6 +149,7 @@ node test/smoke.js
 A Chrome extension for openbattle.ir (an Iranian-hosted OpenFront build).
 
 - **One-key building.** Press a key and the structure is placed instantly at the tile under your cursor — no ghost to arm, no second click, no drag and drop. Defaults are `Shift`+`1..0`, mirroring the game's own numbering and chosen so they cannot collide with it. Every placement is validated against the game's own worker for legality and price before anything is sent.
-- **Auto-play bot.** Picks its own opening (open land, ocean access, distance from rivals), grabs territory, runs an economy, defends, builds a navy, nukes enemy infrastructure clusters and handles alliances. Four presets plus per-subsystem toggles and fine-tuning sliders. Intended for singleplayer and private lobbies.
+- **Auto-play bot.** Picks its own opening (open land, ocean access, distance from rivals), grabs territory, runs an economy, defends, builds a navy, nukes enemy infrastructure clusters and handles alliances. Five presets plus per-subsystem toggles and fine-tuning sliders. Intended for singleplayer and private lobbies.
+- **God mode** (default preset) plays the combat maths rather than the mood: per conquered tile the attacker pays `within(D/T, 0.6, 2) * mag * 0.8`, which bottoms out only once the committed troops `T` exceed about 1.7x the defender's whole army `D` — so it refuses fights below that line instead of paying triple for the same ground, sizes each attack to the target rather than emptying the barracks, keeps its army off the regeneration ceiling (`(1 - troops/max)`), scales its garrison to incoming pressure, flood-fills the map for unclaimed islands and takes them by sea, treats defence posts as the cheapest force multiplier on the board (x5 defence within 30 tiles) both to build and to route around, and treats an alliance as a timer — fortifying allied borders, refusing pacts with neighbours it could already overrun, and breaking one when the 30-second traitor penalty is worth paying.
 
 Install unpacked via `chrome://extensions` → Developer mode → Load unpacked. Requires Chrome 111+. Run `node test/smoke.js` for the headless test suite.
