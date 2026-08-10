@@ -770,8 +770,141 @@ async function pump(ticks) {
       Math.abs(lx - isleX) <= 6 && Math.abs(ly - isleY) <= 6,
       "dst " + lx + "," + ly,
     );
-    check("does not ship the whole army out", landing.troops < me._troops * 0.4);
+    check(
+      "does not ship the whole army out",
+      landing.troops < me._troops * 0.35,
+      "sent " + landing.troops + " of " + me._troops,
+    );
   }
+  bot.stop();
+
+  console.log("\n16. growth bands");
+  // Growth is (10 + t^0.73/4) * (1 - t/max); maximising t^0.73 * (1 - t) gives
+  // 0.73(1-u) = u, so the peak sits at u = 0.73/1.73 = 42.2% of the cap. That
+  // is the number the community guides quote, and it is what the bands are
+  // built around.
+  const V = OBA.view();
+  const peakCheck = (() => {
+    const max = 1_000_000;
+    const rate = (t) => (10 + Math.pow(t, 0.73) / 4) * (1 - t / max);
+    let bestT = 0,
+      bestR = -1;
+    for (let t = 1000; t < max; t += 1000) {
+      const r = rate(t);
+      if (r > bestR) {
+        bestR = r;
+        bestT = t;
+      }
+    }
+    return bestT / max;
+  })();
+  check(
+    "the growth peak really is ~42% of the cap",
+    Math.abs(peakCheck - 0.422) < 0.01,
+    "peak at " + (peakCheck * 100).toFixed(1) + "%",
+  );
+
+  me._in = [];
+  me._out = [];
+  const maxT = game.config().maxTroops(me);
+  const bandAt = (frac) => {
+    me._troops = maxT * frac;
+    return bot.assess(V, me).band;
+  };
+  check("a starved army is 'critical'", bandAt(0.2) === "critical");
+  check("an army on the peak is 'growth'", bandAt(0.42) === "growth");
+  check("a rested army is 'ready'", bandAt(0.6) === "ready");
+  check("a full army is 'wasting'", bandAt(0.9) === "wasting");
+
+  console.log("\n17. never everything on one front");
+  me._troops = maxT * 0.9;
+  bot.territory = null;
+  bot.next = {};
+  bot.running = true;
+  await pump(30);
+  const twoFront = bot.assess(V, me);
+  check(
+    "two hostile neighbours are counted",
+    twoFront.fronts >= 2,
+    "fronts " + twoFront.fronts,
+  );
+  check(
+    "so no single operation may take the whole free force",
+    twoFront.perAttackCap < twoFront.budget * 0.6,
+    "cap " + Math.round(twoFront.perAttackCap) + " of budget " + Math.round(twoFront.budget),
+  );
+  check(
+    "and a garrison is always withheld",
+    twoFront.garrison > 0 && twoFront.budget < twoFront.troops,
+  );
+
+  sent.length = 0;
+  bot.next = {};
+  await pump(30);
+  const anyAttack = sent.filter((i) => i.type === "attack");
+  check(
+    "every attack respects the single-operation cap",
+    anyAttack.every((a) => a.troops <= twoFront.perAttackCap * 1.35),
+    anyAttack.map((a) => a.troops).join(","),
+  );
+
+  console.log("\n18. recall only when there is no choice");
+  me._troops = maxT * 0.9;
+  me._in = [];
+  me._out = [{ attackerID: 1, targetID: 2, troops: 60000, id: "atk-1", retreating: false }];
+  bot.next = {};
+  sent.length = 0;
+  bot.assess(V, me);
+  bot.doRetreat(V, me);
+  check("a calm front never recalls an attack", sent.length === 0);
+
+  // Now more is coming at us than is standing at home.
+  me._troops = 30000;
+  me._in = [{ attackerID: 2, targetID: 1, troops: 90000, id: "in-1", retreating: false }];
+  sent.length = 0;
+  bot.assess(V, me);
+  bot.doRetreat(V, me);
+  const recall = sent.find((i) => i.type === "cancel_attack");
+  check("but an overwhelming attack pulls troops home", !!recall, JSON.stringify(sent));
+  check("and it recalls the right one", !!recall && recall.attackID === "atk-1");
+
+  console.log("\n19. structures go in good places");
+  me._in = [];
+  me._out = [];
+  me._troops = maxT * 0.5;
+  bot.territory = null;
+  bot.next = {};
+  await pump(30);
+  check("hostile frontage is identified", !!bot.territory && bot.territory.hostile.length > 0);
+
+  const interiorRanked = bot.rankSafe(V, bot.territory.interior, 8);
+  const distToTrouble = (t) => {
+    let best = Infinity;
+    for (const ht of bot.territory.hostile)
+      best = Math.min(best, V.euclideanDistSquared(t, ht));
+    return best;
+  };
+  const avgRanked =
+    interiorRanked.reduce((a, t) => a + distToTrouble(t), 0) / interiorRanked.length;
+  const avgAll =
+    bot.territory.interior.reduce((a, t) => a + distToTrouble(t), 0) /
+    bot.territory.interior.length;
+  check(
+    "cities are steered away from contested borders",
+    avgRanked > avgAll,
+    "ranked " + Math.round(avgRanked) + " vs pool average " + Math.round(avgAll),
+  );
+
+  // Ports want distance from our other ports: trade income is
+  // 75000/(1+e^(-0.03(d-300))) + 50d, so a short route earns almost nothing.
+  const existingPort = bot.territory.shore[0];
+  const portRanked = bot.rankSpread(V, bot.territory.shore, [existingPort], 6);
+  check(
+    "ports are spread out rather than clustered",
+    V.euclideanDistSquared(portRanked[0], existingPort) >
+      V.euclideanDistSquared(bot.territory.shore[1], existingPort),
+    "best " + V.euclideanDistSquared(portRanked[0], existingPort),
+  );
   bot.stop();
 
   console.log(

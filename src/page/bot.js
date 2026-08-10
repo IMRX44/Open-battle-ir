@@ -134,6 +134,7 @@
   var EVERY = {
     spawn: 8,
     territory: 25,
+    retreat: 12,
     expand: 10,
     attack: 12,
     economy: 18,
@@ -254,12 +255,90 @@
    * taken out of a budget, never out of "whatever we happen to have".    *
    * ------------------------------------------------------------------ */
 
+  /**
+   * Where the army sits on the growth curve.
+   *
+   * Regeneration is (10 + troops^0.73 / 4) * (1 - troops / max). Dropping the
+   * constant and maximising u^0.73 * (1 - u) gives 0.73(1-u) = u, so growth
+   * peaks at u = 0.73/1.73 = 42% of the cap. Below that the army is too small
+   * to deter anyone; above it every idle troop is income the player never
+   * collects. The bands come straight off that curve.
+   */
+  var PEAK_RATIO = 0.422;
+
+  function bandOf(ratio) {
+    if (ratio < 0.3) return "critical"; // too thin to pick fights
+    if (ratio < 0.5) return "growth"; // sitting on the peak, take land
+    if (ratio < 0.7) return "ready"; // slower growth, real reserve
+    if (ratio < 0.8) return "throttled"; // growth choked, start spending
+    return "wasting"; // idle troops earning nothing
+  }
+
   /** Total troops currently bearing down on us. */
   Bot.prototype.pressure = function (me) {
     var inc = me.incomingAttacks() || [];
     var sum = 0;
     for (var i = 0; i < inc.length; i++) sum += inc[i].troops || 0;
     return sum;
+  };
+
+  /**
+   * One read of the whole position per cycle: army health, how many separate
+   * enemies can reach us, how much must stay home, and — crucially — the most
+   * that may go into any single operation. Committing everything to one front
+   * is how a winning position is lost to the neighbour who was not in it.
+   */
+  Bot.prototype.assess = function (g, me) {
+    var cfg = this.cfg;
+    var terr = this.territory;
+    var troops = me.troops();
+    var max = this.maxTroops(g, me);
+    var ratio = max > 0 ? troops / max : 0;
+
+    var fronts = 0;
+    var alliedFronts = 0;
+    if (terr) {
+      for (var sid in terr.enemyEdge) {
+        var p = g.playerBySmallID(+sid);
+        if (!p || !p.isPlayer || !p.isPlayer() || !p.isAlive()) continue;
+        var friendly = false;
+        try {
+          friendly = me.isFriendly(p);
+        } catch (e) {}
+        if (friendly) alliedFronts++;
+        else fronts++;
+      }
+    }
+
+    var pressure = this.pressure(me);
+
+    // Garrison grows with the number of neighbours who could open a second
+    // front, and with whatever is already on its way. An allied border still
+    // counts for something: the pact is a timer.
+    var base = max * (cfg.reserve + 0.06 * Math.min(fronts, 3) + 0.02 * Math.min(alliedFronts, 3));
+    var garrison = Math.max(base, pressure * 1.6);
+    var budget = Math.max(0, troops - garrison);
+
+    // Never pour the entire free force into one operation while another
+    // neighbour could walk in behind it.
+    var share = fronts > 1 ? 0.55 : 0.85;
+    var perAttackCap = budget * share;
+
+    this.sit = {
+      troops: troops,
+      max: max,
+      ratio: ratio,
+      band: bandOf(ratio),
+      fronts: fronts,
+      alliedFronts: alliedFronts,
+      pressure: pressure,
+      garrison: garrison,
+      budget: budget,
+      perAttackCap: perAttackCap,
+      // Troops above the growth peak cost nothing to spend.
+      surplus: Math.max(0, troops - PEAK_RATIO * max),
+    };
+    return this.sit;
   };
 
   /** Troops that must stay home no matter how good the opportunity looks. */
@@ -339,6 +418,13 @@
 
     if (this.due("territory", tick)) this.refreshTerritory(g, me);
     if (!this.territory) return;
+
+    if (this.cfg.attackEfficiency > 0) {
+      this.assess(g, me);
+      // Pulling troops out of a stalling offensive is the only reserve left
+      // once the garrison is already committed.
+      if (this.due("retreat", tick)) this.doRetreat(g, me);
+    }
 
     if (this.due("expand", tick)) this.doExpand(g, me);
     if (this.due("attack", tick)) this.doAttack(g, me);
@@ -523,7 +609,21 @@
       var wet = Math.min(nearOcean / maxWet, 0.28) / 0.28;
       var away = noRivals ? 0.5 : Math.min(d < 0 ? 30 : d, 26) / 26;
 
-      var score = room * 100 + wide * 45 + wet * 50 + (coastal ? 38 : 0) + away * 95;
+      // Water is a wall nobody can walk through. A neck of land between two
+      // seas, or a peninsula, means a short land border to hold and a long
+      // coast to trade from — the position holds itself while the economy
+      // runs. Peaks where roughly half the surroundings are sea; a speck in
+      // open ocean scores badly on `room` anyway.
+      var wetShare = nearOcean / Math.max(1, nearOcean + nearLand);
+      var shelter = 1 - Math.abs(wetShare - 0.5) / 0.5;
+
+      var score =
+        room * 100 +
+        wide * 45 +
+        wet * 50 +
+        shelter * 60 +
+        (coastal ? 38 : 0) +
+        away * 95;
 
       // Being jammed right up against a claimed cell is a losing opening.
       if (!noRivals && d >= 0 && d <= 2) score -= 160;
@@ -694,9 +794,31 @@
       }
     }
 
+    // Border tiles that face somebody we are not allied with — the reference
+    // set for "how exposed is this spot".
+    var hostile = [];
+    for (var q = 0; q < border.length && hostile.length < 200; q += sample) {
+      var bt = border[q];
+      var nb2 = g.neighbors(bt);
+      for (var m = 0; m < nb2.length; m++) {
+        var o2 = g.ownerID(nb2[m]);
+        if (o2 === sid || !g.hasOwner(nb2[m])) continue;
+        var op = g.playerBySmallID(o2);
+        if (!op || !op.isPlayer || !op.isPlayer()) continue;
+        var fr = false;
+        try {
+          fr = me.isFriendly(op);
+        } catch (e) {}
+        if (fr) continue;
+        hostile.push(bt);
+        break;
+      }
+    }
+
     this.territory = {
       at: Date.now(),
       border: border,
+      hostile: hostile,
       interior: shuffle(interior, this.rng),
       shore: shuffle(shore, this.rng),
       neutralEdge: neutralEdge,
@@ -707,12 +829,143 @@
   };
 
   /* ------------------------------------------------------------------ *
+   * Where to put things                                                 *
+   *                                                                     *
+   * A structure is a bank of gold sitting on the map. Put it somewhere   *
+   * that will still be ours in ten minutes, and the investment compounds; *
+   * put it on a contested border and it funds the enemy instead.         *
+   * ------------------------------------------------------------------ */
+
+  function sampleOf(arr, n, rng) {
+    if (arr.length <= n) return arr.slice();
+    var out = [];
+    for (var i = 0; i < n; i++) out.push(arr[(rng() * arr.length) | 0]);
+    return out;
+  }
+
+  function rankBy(cand, scoreFn) {
+    var scored = [];
+    for (var i = 0; i < cand.length; i++)
+      scored.push({ t: cand[i], s: scoreFn(cand[i]) });
+    scored.sort(function (a, b) {
+      return b.s - a.s;
+    });
+    var out = [];
+    for (var k = 0; k < scored.length; k++) out.push(scored[k].t);
+    return out;
+  }
+
+  /** Deepest inside our own territory — cities and factories go here. */
+  Bot.prototype.rankSafe = function (g, pool, n) {
+    var terr = this.territory;
+    var hostile = (terr && terr.hostile) || [];
+    var cand = sampleOf(pool || [], 300, this.rng);
+    if (!cand.length) return [];
+    if (!hostile.length) return cand.slice(0, n);
+    var hs = sampleOf(hostile, 40, this.rng);
+    return rankBy(cand, function (t) {
+      var best = Infinity;
+      for (var i = 0; i < hs.length; i++) {
+        var d = g.euclideanDistSquared(t, hs[i]);
+        if (d < best) best = d;
+      }
+      return best; // farther from trouble is better
+    }).slice(0, n);
+  };
+
+  /**
+   * Ports want distance from each other. Trade income is
+   * 75000 / (1 + e^(-0.03 * (dist - 300))) + 50 * dist, so a route under
+   * ~300 tiles earns almost nothing while a long one pays nearly the full
+   * 75k. Clustering ports on one bay throws that away.
+   */
+  Bot.prototype.rankSpread = function (g, pool, existing, n) {
+    var cand = sampleOf(pool || [], 300, this.rng);
+    if (!cand.length) return [];
+    if (!existing.length) return cand.slice(0, n);
+    return rankBy(cand, function (t) {
+      var best = Infinity;
+      for (var i = 0; i < existing.length; i++) {
+        var d = g.euclideanDistSquared(t, existing[i]);
+        if (d < best) best = d;
+      }
+      return best;
+    }).slice(0, n);
+  };
+
+  /**
+   * Defence posts belong on the narrowest ground. The x5 defence bonus covers
+   * a 30-tile radius, so on an isthmus one post can seal an entire approach
+   * that would take five posts to hold on open plain.
+   */
+  Bot.prototype.rankChoke = function (g, pool, n) {
+    var cand = sampleOf(pool || [], 160, this.rng);
+    if (!cand.length) return [];
+    var w = g.width(),
+      h = g.height();
+    return rankBy(cand, function (t) {
+      var x0 = g.x(t),
+        y0 = g.y(t),
+        land = 0;
+      for (var dy = -12; dy <= 12; dy += 3) {
+        for (var dx = -12; dx <= 12; dx += 3) {
+          var x = x0 + dx,
+            y = y0 + dy;
+          if (x < 0 || y < 0 || x >= w || y >= h) continue;
+          if (g.isLand(g.ref(x, y))) land++;
+        }
+      }
+      return -land; // less land around = narrower neck = better post
+    }).slice(0, n);
+  };
+
+  Bot.prototype.unitTiles = function (me, type) {
+    var out = [];
+    try {
+      var us = me.units(type);
+      for (var i = 0; i < us.length; i++) out.push(us[i].tile());
+    } catch (e) {}
+    return out;
+  };
+
+  /* ------------------------------------------------------------------ *
    * Expansion into unclaimed land                                       *
    *                                                                     *
    * Neutral tiles cost a flat, tiny amount of troops, so as long as      *
    * there is free land on our border, taking it beats everything else:   *
    * tiles raise the troop ceiling, which compounds.                      *
    * ------------------------------------------------------------------ */
+  /**
+   * Last resort. Troops in an offensive count for nothing on defence, so when
+   * what is coming at us outweighs what is standing at home, the offensive is
+   * the reserve — recall the largest one and let it garrison instead. Only
+   * when there is no other choice: a cancelled attack forfeits a quarter of
+   * its troops on the way back.
+   */
+  Bot.prototype.doRetreat = function (g, me) {
+    var sit = this.sit;
+    if (!sit || sit.pressure <= 0) return;
+    // Home troops still comfortably cover the threat — keep attacking.
+    if (sit.troops >= sit.pressure * 1.15) return;
+
+    var out = me.outgoingAttacks() || [];
+    var biggest = null;
+    for (var i = 0; i < out.length; i++) {
+      if (out[i].retreating) continue;
+      if (!biggest || out[i].troops > biggest.troops) biggest = out[i];
+    }
+    if (!biggest || !biggest.id) return;
+    // Not worth the recall penalty for a token force.
+    if (biggest.troops < sit.pressure * 0.25) return;
+
+    OBA.sendIntent({ type: "cancel_attack", attackID: biggest.id });
+    this.stats.actions++;
+    OBA.log(
+      "warn",
+      "عقب‌نشینی برای دفاع — " + Math.round(biggest.troops / 1000) + "K نیرو برمی‌گردد",
+    );
+  };
+
   Bot.prototype.doExpand = function (g, me) {
     var terr = this.territory;
     if (!terr || terr.neutralEdge <= 0) return;
@@ -722,13 +975,19 @@
     var max = this.maxTroops(g, me);
 
     if (cfg.attackEfficiency > 0) {
+      var sit = this.sit || this.assess(g, me);
+      // Too thin to be spending anything: growth first, deterrence second.
+      if (sit.band === "critical") return;
+
       // A neutral tile costs a flat mag/5 troops whatever the stack size, but
       // the conquest rate rises with it (the per-tile budget charge bottoms
-      // out at 5 once the stack is large), and same-target attacks merge. So
-      // topping the wave up beats holding troops back — the only thing worth
-      // keeping is the garrison.
-      if (troops < max * cfg.troopBandLow) return;
-      var send = Math.floor(this.spendable(g, me) * cfg.expandRatio);
+      // out at 5 once the stack is large), and same-target attacks merge, so
+      // topping the wave up beats holding troops back. Free land is still the
+      // best return in the game — it is cheap, and every tile raises the cap.
+      var allow = sit.perAttackCap * 1.3;
+      // Idle troops above the growth peak earn nothing; push them out first.
+      if (sit.band === "wasting") allow = Math.max(allow, sit.surplus);
+      var send = Math.floor(Math.min(sit.budget, allow) * cfg.expandRatio);
       if (send < 1) return;
       OBA.sendIntent({ type: "attack", targetID: null, troops: send });
       this.stats.actions++;
@@ -862,10 +1121,20 @@
   Bot.prototype.doAttackByMath = function (g, me, attacking) {
     var cfg = this.cfg;
     var terr = this.territory;
-    var budget = this.spendable(g, me);
-    if (budget < 1) return;
+    var sit = this.sit || this.assess(g, me);
 
-    var myTroops = me.troops();
+    // An army below the deterrence floor has no business starting a war; one
+    // sitting on the growth peak should be taking free land, not trading
+    // troops. Finishing off a dying neighbour is the exception — that is
+    // territory, not a war.
+    var mayOpenWar = sit.band !== "critical" && sit.band !== "growth";
+
+    // Whatever we send must fit inside the single-operation cap, so a second
+    // neighbour still meets a defended border.
+    var ceiling = Math.min(sit.budget, sit.perAttackCap);
+    if (ceiling < 1) return;
+
+    var myTroops = sit.troops;
     var best = null;
 
     for (var sidStr in terr.enemyEdge) {
@@ -883,7 +1152,11 @@
       var needed = D * cfg.attackEfficiency;
       // The one hard gate: if we cannot bring enough to fight cheaply, we
       // do not fight at all.
-      if (budget < needed) continue;
+      if (ceiling < needed) continue;
+
+      var tiles = Math.max(1, p.numTilesOwned());
+      var collapsing = tiles < 400 || D < myTroops * 0.05;
+      if (!mayOpenWar && !collapsing) continue;
 
       if (friendly) {
         // Breaking a pact costs half defence and a fifth of our speed for
@@ -893,7 +1166,6 @@
         if (D > myTroops * 0.35) continue;
       }
 
-      var tiles = Math.max(1, p.numTilesOwned());
       var density = D / tiles; // troops defending each tile
       var edge = terr.enemyEdge[sid];
 
@@ -905,11 +1177,11 @@
         // Frontage drives the conquest rate.
         Math.min(edge, 600) * 0.03 +
         // Overkill capacity means we finish before they can regenerate.
-        Math.min(budget / needed, 4) * 6 +
+        Math.min(ceiling / needed, 4) * 6 +
         (p.type() === PT.Bot ? 6 : 0) +
         (p.isTraitor && p.isTraitor() ? 5 : 0) +
         // A player already collapsing is free territory.
-        (tiles < 400 ? 8 : 0) -
+        (collapsing ? 10 : 0) -
         // Five times the defence in a thirty-tile radius. Go around it.
         (fortified ? 25 : 0) -
         (friendly ? 10 : 0);
@@ -921,7 +1193,7 @@
 
     // Send what the target costs plus a margin, not the whole army: the
     // surplus defends the homeland and keeps regeneration running.
-    var send = Math.floor(Math.min(budget, best.needed * 1.15));
+    var send = Math.floor(Math.min(ceiling, best.needed * 1.15));
     if (send < 1) return;
     OBA.sendIntent({ type: "attack", targetID: best.p.id(), troops: send });
     this.stats.actions++;
@@ -997,15 +1269,25 @@
     var reserve = cfg.nukes && silos > 0 && tiles > 2500 ? 900000 : 0;
     var spendable = gold - reserve;
 
+    // Interior spots ranked by how far they sit from any hostile border, and
+    // coastal spots ranked by how far they sit from our own existing ports —
+    // trade income is dominated by route length.
+    var safe = this.rankSafe(g, terr.interior, 8);
+    var spread = this.rankSpread(g, terr.shore, this.unitTiles(me, U.Port), 8);
+    if (!safe.length) safe = terr.interior;
+    if (!spread.length) spread = terr.shore;
+
+    // A city adds 250,000 to the troop cap per level and its cost stops
+    // doubling at a million, so cities are the single best gold sink in the
+    // game once the first ports are trading.
     var want = [];
-    if (ports < Math.min(2, portTarget)) want.push([U.Port, terr.shore]);
-    if (cities < cityTarget) want.push([U.City, terr.interior]);
-    if (ports < portTarget) want.push([U.Port, terr.shore]);
-    if (factories < factoryTarget) want.push([U.Factory, terr.interior]);
-    if (silos < siloTarget) want.push([U.MissileSilo, terr.interior]);
+    if (ports < Math.min(2, portTarget)) want.push([U.Port, spread]);
+    if (cities < cityTarget) want.push([U.City, safe]);
+    if (ports < portTarget) want.push([U.Port, spread]);
+    if (factories < factoryTarget) want.push([U.Factory, safe]);
+    if (silos < siloTarget) want.push([U.MissileSilo, safe]);
     // Everything capped and gold still piling up — pour it into upgrades.
-    if (!want.length || gold > 4000000)
-      want.push([U.City, terr.interior], [U.Port, terr.shore]);
+    if (!want.length || gold > 4000000) want.push([U.City, safe], [U.Port, spread]);
 
     if (!want.length) return;
     var choice = want[0];
@@ -1034,12 +1316,15 @@
 
     var self = this;
     var tried = 0;
-    var MAX_TRIES = 4;
+    var MAX_TRIES = 6;
 
     function attempt() {
-      if (tried >= MAX_TRIES || !pool.length) return finish(false);
+      if (tried >= MAX_TRIES || tried >= pool.length) return finish(false);
+      // Pools arrive ranked best-first; unranked ones were shuffled when the
+      // territory snapshot was built, so walking from the front is right for
+      // both.
+      var tile = pool[tried];
       tried++;
-      var tile = pool[(self.rng() * pool.length) | 0];
       return me
         .actions(tile, [type])
         .then(function (actions) {
@@ -1135,8 +1420,16 @@
     var perPost = cfg.attackEfficiency > 0 ? 40 : 70;
     var postTarget = clamp(Math.floor(hot / perPost), 0, cfg.maxDefensePosts);
     if (posts < postTarget && hotTiles.length) {
-      // Defence posts belong on the contested edge, not in the interior.
-      var pool = hotTiles.concat(terr.border.slice(0, 400));
+      // Defence posts belong on the contested edge, and above all on the
+      // narrow parts of it, where one post seals an approach.
+      var pool = this.rankChoke(
+        g,
+        (terr.hostile && terr.hostile.length ? terr.hostile : hotTiles).concat(
+          hotTiles,
+        ),
+        8,
+      );
+      if (!pool.length) pool = hotTiles;
       this.tryBuild(g, me, U.DefensePost, pool, gold, "defense");
       return;
     }
@@ -1157,7 +1450,15 @@
       ? clamp(1 + Math.floor(me.numTilesOwned() / 4500), 1, cfg.maxSams)
       : 0;
     if (sams < samTarget) {
-      this.tryBuild(g, me, U.SAMLauncher, terr.interior, gold, "defense");
+      // Cover the infrastructure, not empty ground.
+      var assets = this.unitTiles(me, U.City).concat(
+        this.unitTiles(me, U.Port),
+        this.unitTiles(me, U.Factory),
+      );
+      var samPool = assets.length
+        ? this.rankSpread(g, terr.interior, this.unitTiles(me, U.SAMLauncher), 8)
+        : terr.interior;
+      this.tryBuild(g, me, U.SAMLauncher, samPool, gold, "defense");
     }
   };
 
@@ -1279,19 +1580,33 @@
     // Worth a landing: nothing of ours on it, real room, and a beach.
     var minFree = Math.max(12, (60 / (step * step)) | 0);
     var targets = [];
+    var footholds = 0;
     for (var c = 0; c < comps.length; c++) {
       var r = comps[c];
-      if (r.mine > 0 || r.free < minFree || !r.shores.length) continue;
+      if (r.mine > 0) {
+        footholds++;
+        continue;
+      }
+      if (r.free < minFree || !r.shores.length) continue;
       targets.push({ free: r.free, shores: r.shores });
     }
     targets.sort(function (a, b) {
       return b.free - a.free;
     });
-    this.islands = { at: this.lastTick, targets: targets.slice(0, 12) };
+    this.islands = {
+      at: this.lastTick,
+      targets: targets.slice(0, 12),
+      // Everything we own on one landmass is everything we own on one front.
+      // A second body of land cannot be reached by whoever is grinding down
+      // the first, so the game is still alive after a bad war.
+      footholds: footholds,
+    };
     if (targets.length)
       OBA.log(
         "info",
-        targets.length + " سرزمین بی‌صاحب برای پیاده‌شدن پیدا شد",
+        targets.length +
+          " سرزمین بی‌صاحب برای پیاده‌شدن پیدا شد" +
+          (footholds < 2 ? " — هنوز پایگاه دوم نداریم" : ""),
       );
   };
 
@@ -1309,9 +1624,16 @@
     } catch (e) {}
     if (afloat >= 3) return;
 
-    var budget = this.spendable(g, me);
-    var max = this.maxTroops(g, me);
-    if (budget < max * 0.12) return;
+    var sit = this.sit || this.assess(g, me);
+    var max = sit.max;
+    // Securing a second landmass is insurance, so it is worth paying for
+    // earlier and more heavily than an ordinary raid. Once we already have
+    // one, further landings wait until there is genuine slack.
+    var firstFoothold = (this.islands.footholds || 0) < 2;
+    var floor = firstFoothold ? 0.1 : 0.22;
+    if (sit.band === "critical" && !firstFoothold) return;
+    var budget = sit.budget;
+    if (budget < max * floor) return;
 
     var origin = terr.shore[(this.rng() * terr.shore.length) | 0];
     var best = null;
@@ -1335,11 +1657,23 @@
       .then(function (spawn) {
         if (!self.running) return;
         if (spawn === false || spawn === undefined || spawn === null) return;
-        var send = Math.floor(Math.min(budget * 0.35, max * 0.25));
+        // A beachhead that arrives too small just dies on the sand; one that
+        // takes the whole army leaves the homeland open. Cap it against the
+        // single-operation ceiling like any other front.
+        var send = Math.floor(
+          Math.min(
+            Math.max(budget * (firstFoothold ? 0.32 : 0.2), max * 0.08),
+            sit.perAttackCap,
+            budget,
+          ),
+        );
         if (send < 1) return;
         OBA.sendIntent({ type: "boat", troops: send, dst: landing });
         self.stats.actions++;
-        OBA.log("good", "پیاده‌شدن روی سرزمین بی‌صاحب");
+        OBA.log(
+          "good",
+          firstFoothold ? "گرفتن پایگاه دوم روی جزیره" : "پیاده‌شدن روی سرزمین بی‌صاحب",
+        );
       })
       .catch(function () {})
       .then(function () {
@@ -1550,11 +1884,20 @@
         for (var k = 0; k < out.length; k++)
           if (out[k].targetID === p.smallID()) busyWith = true;
         if (busyWith) continue;
-        // A neighbour we could already overrun cheaply is territory, not a
-        // partner — signing with them only locks the ground away.
-        if (cfg.distrust && terr && terr.enemyEdge[p.smallID()]) {
-          var cost = Math.max(1, p.troops()) * (cfg.attackEfficiency || 1.7);
-          if (this.spendable(g, me) >= cost) continue;
+        if (cfg.distrust) {
+          // A neighbour we could already overrun cheaply is territory, not a
+          // partner — signing with them only locks the ground away.
+          if (terr && terr.enemyEdge[p.smallID()]) {
+            var cost = Math.max(1, p.troops()) * (cfg.attackEfficiency || 1.7);
+            if (this.spendable(g, me) >= cost) continue;
+          }
+          // Past behaviour is the only evidence available. Someone who has
+          // broken pacts before will break this one at the worst moment.
+          var betrayals = 0;
+          try {
+            betrayals = p.betrayals ? p.betrayals() : 0;
+          } catch (e) {}
+          if (betrayals >= 2) continue;
         }
         if (!pending) pending = p;
         continue;
