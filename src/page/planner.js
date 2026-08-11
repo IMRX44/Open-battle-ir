@@ -298,6 +298,7 @@
     var threat = clamp((terr.hostile ? terr.hostile.length : 0) / 60, 0, 1);
     var nukeThreat = world.nukeThreat;
     var sit = this.sit || {};
+    var assets = have.city + have.port + have.factory + have.silo;
 
     // A city raises the troop ceiling by 250,000. That is worthless while the
     // army is nowhere near the ceiling it already has — growth is
@@ -336,17 +337,25 @@
           post: clamp(threat * 3 - have.post / 8, 0, 1),
           // Warheads are how a stalled game gets unstuck, and the only answer
           // to an opponent who has already built a wall of defence posts.
-          silo: cfg.nukes ? clamp((1 + tiles / 4000 - have.silo) / 3, 0, 1) : 0,
-          // Two reasons to want a launcher: somebody can shoot at us, or we
-          // have enough built up in one place that losing it to a single
-          // warhead would hurt. A cluster of cities with no cover over it is
-          // an invitation.
+          // A silo is only worth its million if its missiles get fired. Nine
+          // of them sitting idle is nine million gold that bought nothing —
+          // so once there is unused launch capacity, stop building capacity.
+          silo:
+            cfg.nukes && this.idleSlots(me) < 2
+              ? clamp((clamp(2 + Math.floor(tiles / 8000), 1, 4) - have.silo) / 2, 0, 1)
+              : 0,
+          // Air defence scales with how much there is to lose. Two warheads
+          // ended the reported game because there was exactly one launcher on
+          // the board; a player with real infrastructure needs a real screen
+          // over it, whether or not anyone has shown a silo yet.
           sam: clamp(
-            Math.max(
-              nukeThreat * 2,
-              have.city + have.port + have.factory + have.silo >= 5 ? 0.7 : 0,
+            (clamp(
+              Math.ceil(assets / 3),
+              nukeThreat > 0 ? 2 : assets >= 4 ? 1 : 0,
+              cfg.maxSams,
             ) -
-              have.sam / 6,
+              have.sam) /
+              2,
             0,
             1,
           ),
@@ -378,7 +387,10 @@
             bu.upgradeCosts && bu.upgradeCosts.length
               ? num(bu.upgradeCosts[0])
               : num(bu.cost);
-          var upScore = this.upgradeValue(bu.type, want, world, me);
+          var upScore = this.upgradeValue(bu.type, want, world, me, {
+            assets: assets,
+            threat: threat,
+          });
           if (upScore > 0)
             options.push({
               kind: "upgrade",
@@ -514,9 +526,12 @@
         // territory insurance in the game.
         return 125 * want.post;
       case U.MissileSilo:
-        return 85 * want.silo;
+        return 75 * want.silo;
       case U.SAMLauncher:
-        return 115 * want.sam;
+        // Ranked above another silo deliberately. Launch capacity we are not
+        // using wins nothing; a screen over the infrastructure is what stops
+        // a two-warhead opening from ending the game.
+        return 135 * want.sam;
       default:
         return 0;
     }
@@ -530,14 +545,20 @@
    * 10). Against an opponent who answers a defence line with fifty warheads,
    * both of those matter more than another building.
    */
-  Bot.upgradeValue = function (type, want, world, me) {
+  Bot.upgradeValue = function (type, want, world, me, ctx) {
+    ctx = ctx || {};
     switch (type) {
       case U.MissileSilo:
+        // Levels are launch capacity, which only pays off if the missiles go
+        // somewhere. Deepen the silos we have rather than adding idle ones.
         return this.avgLevel(me, U.MissileSilo) < SILO_TARGET_LEVEL ? 105 : 25;
       case U.SAMLauncher:
+        // Once the screen is wide enough, depth is the remaining value — and
+        // the more infrastructure sits under it, the more that depth is
+        // worth, whether or not anyone has revealed a silo yet.
         return (
-          (this.avgLevel(me, U.SAMLauncher) < SAM_TARGET_LEVEL ? 120 : 40) *
-          Math.max(0.35, world.nukeThreat)
+          (this.avgLevel(me, U.SAMLauncher) < SAM_TARGET_LEVEL ? 130 : 45) *
+          Math.max(0.4, world.nukeThreat, clamp((ctx.assets || 0) / 8, 0, 1))
         );
       case U.City:
         return 80 * Math.max(want.city, 0.4);
@@ -561,6 +582,29 @@
     } catch (e) {
       return 0;
     }
+  };
+
+  /** Launch capacity standing idle right now, across every finished silo. */
+  Bot.idleSlots = function (me) {
+    var silos;
+    try {
+      silos = me.units(U.MissileSilo);
+    } catch (e) {
+      return 0;
+    }
+    var slots = 0;
+    for (var i = 0; i < silos.length; i++) {
+      var s = silos[i];
+      try {
+        if (s.isUnderConstruction && s.isUnderConstruction()) continue;
+        var lvl = s.level ? s.level() : 1;
+        var queued = s.missileTimerQueue ? s.missileTimerQueue().length : 0;
+        slots += Math.max(0, lvl - queued);
+      } catch (e) {
+        slots += 1;
+      }
+    }
+    return slots;
   };
 
   Bot.liveCount = function (me, type) {
@@ -615,7 +659,18 @@
     if (!freeGame && gold < 800000) return;
 
     var clusters = this.nukeTargets(g, me);
-    if (!clusters.length) return;
+    if (!clusters.length) {
+      // Silos that never fire are the most expensive decoration in the game.
+      // Say so, rather than letting it look like the bot is doing something.
+      if (slots >= 2 && this.lastTick - (this._noTargetAt || -999) > 600) {
+        this._noTargetAt = this.lastTick;
+        OBA.log(
+          "warn",
+          slots + " موشک آماده ولی هدف ارزشمندی در دید نیست",
+        );
+      }
+      return;
+    }
 
     // Never fire more than the gold covers, and leave the economy alive.
     var affordable = freeGame ? slots : Math.floor(gold / 800000);
@@ -633,14 +688,23 @@
 
     var self = this;
     this.busy.nuke = true;
-    var wanted = gold > 12000000 ? U.HydrogenBomb : U.AtomBomb;
+
+    // A hydrogen bomb costs nearly seven times an atom bomb. Worth it over a
+    // dense target, pure waste on a lone outpost — so the warhead is chosen
+    // per target rather than by how rich we happen to feel.
+    function warheadFor(c) {
+      return gold > 12000000 && (c.value || 0) >= 6
+        ? U.HydrogenBomb
+        : U.AtomBomb;
+    }
 
     Promise.all(
       picks.map(function (c) {
+        var w = warheadFor(c);
         return me
-          .actions(c.tile, [wanted])
+          .actions(c.tile, [w])
           .then(function (a) {
-            return { c: c, a: a };
+            return { c: c, a: a, w: w };
           })
           .catch(function () {
             return null;
@@ -656,12 +720,12 @@
           var list = rs[i].a.buildableUnits || [];
           for (var k = 0; k < list.length; k++) {
             var bu = list[k];
-            if (bu.type !== wanted || bu.canBuild === false) continue;
+            if (bu.type !== rs[i].w || bu.canBuild === false) continue;
             var cost = num(bu.cost);
             if (!freeGame && cost > purse) break;
             OBA.sendIntent({
               type: "build_unit",
-              unit: wanted,
+              unit: rs[i].w,
               tile: bu.canBuild,
               rocketDirectionUp: true,
             });
@@ -671,8 +735,7 @@
             self.stats.nukes++;
           }
         }
-        if (fired)
-          OBA.log("good", "شلیک " + fired + " موشک " + wanted);
+        if (fired) OBA.log("good", "شلیک " + fired + " موشک");
       })
       .catch(function () {})
       .then(function () {
@@ -724,18 +787,41 @@
       hostile.push(u);
       if (u.type() === U.SAMLauncher) enemySams.push(u);
     }
-    if (hostile.length < 2) return [];
+    if (!hostile.length) return [];
 
     var world = this.world;
     var R2 = 25 * 25;
     var limit = Math.min(hostile.length, 240);
+
+    // Not all structures are worth the same. A launcher or a silo is a
+    // strategic asset; a defence post is a speed bump. Scoring by weight
+    // rather than by headcount is also what makes a spread-out opponent
+    // targetable at all — the old rule needed two buildings inside twenty
+    // five tiles, so a player who spaces their infrastructure out was
+    // effectively immune and every silo we owned sat idle.
+    function weightOf(u) {
+      var t = u.type();
+      if (t === U.SAMLauncher || t === U.MissileSilo) return 3;
+      if (t === U.City || t === U.Port || t === U.Factory) return 2;
+      return 1;
+    }
+
+    // With gold to spare a single city is worth a 750k warhead; when it is
+    // tight, hold out for something denser.
+    var rich = num(me.gold()) > 8000000 || this.cfg.freeBuild || this._announcedFree;
+    var minValue = rich ? 2 : 3;
+
     var scored = [];
     for (var a = 0; a < limit; a++) {
       var ta = hostile[a].tile();
       var count = 0;
+      var value = 0;
       for (var b = 0; b < limit; b++)
-        if (g.euclideanDistSquared(ta, hostile[b].tile()) <= R2) count++;
-      if (count < 2) continue;
+        if (g.euclideanDistSquared(ta, hostile[b].tile()) <= R2) {
+          count++;
+          value += weightOf(hostile[b]);
+        }
+      if (value < minValue) continue;
 
       // Sitting under a launcher makes the shot less likely to land, not
       // worthless — and knocking the launcher out opens everything behind it.
@@ -761,13 +847,20 @@
       scored.push({
         tile: ta,
         count: count,
+        value: value,
         covered: covered,
         // A launcher engages one missile at a time and then reloads for
         // ninety ticks. One warhead into that is a wasted warhead; three
         // arriving together are not — which is why real games are decided by
         // salvos rather than single shots.
         need: covered ? 3 : 1,
-        score: count + leaderBonus - (covered ? 2.5 : 0),
+        // Their air defence is the first thing to remove: everything behind
+        // it becomes reachable once it is gone.
+        score:
+          value +
+          (weightOf(hostile[a]) === 3 ? 4 : 0) +
+          leaderBonus -
+          (covered ? 2.5 : 0),
       });
     }
     scored.sort(function (x, y) {

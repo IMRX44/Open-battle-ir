@@ -1449,6 +1449,175 @@ async function pump(ticks) {
   );
   bot.stop();
 
+  console.log("\n34. a spread-out opponent is still a target");
+  // The reported match: nine silos built, not one missile fired, then two
+  // enemy warheads ended it. The old rule needed two enemy buildings inside
+  // twenty-five tiles, so anyone who spaced their infrastructure out was
+  // effectively immune and every silo sat idle.
+  const V3 = OBA.view();
+  game._players = [me, foe];
+  me._units.length = 0;
+  me._gold = 25000000;
+  me._friends = {};
+  foe._friends = {};
+  foe._units.length = 0;
+  // Four enemy structures, each far from the others — no cluster anywhere.
+  foe._units.push(makeUnit(UnitType.City, 20 * W + 40, foe, 1, 0));
+  foe._units.push(makeUnit(UnitType.Port, 60 * W + 30, foe, 1, 0));
+  foe._units.push(makeUnit(UnitType.SAMLauncher, 85 * W + 50, foe, 1, 0));
+  foe._units.push(makeUnit(UnitType.Factory, 40 * W + 70, foe, 1, 0));
+  me._units.push(makeUnit(UnitType.MissileSilo, cy * W + cx, me, 3, 0));
+  bot.survey(V3, me);
+
+  const spreadTargets = bot.nukeTargets(V3, me);
+  check(
+    "isolated enemy structures are targetable",
+    spreadTargets.length > 0,
+    "targets " + spreadTargets.length,
+  );
+  check(
+    "their launcher is the first thing on the list",
+    spreadTargets.length > 0 &&
+      spreadTargets[0].tile === 85 * W + 50,
+    spreadTargets.map((t) => t.tile).join(","),
+  );
+
+  sent.length = 0;
+  bot.busy.nuke = false;
+  bot.running = true;
+  bot.planNukes(V3, me);
+  await sleep(10);
+  check(
+    "and the silo actually fires",
+    sent.some((i) => i.type === "build_unit" && i.unit === UnitType.AtomBomb),
+    JSON.stringify(sent.map((s) => s.unit)),
+  );
+  check(
+    "with a 750k atom bomb, not a 5M hydrogen bomb, for a lone structure",
+    !sent.some((i) => i.unit === UnitType.HydrogenBomb),
+    JSON.stringify(sent.map((s) => s.unit)),
+  );
+
+  console.log("\n35. idle silos are not worth building");
+  // Nine silos with nothing to launch is nine million gold that bought
+  // nothing. Capacity only earns once it is being used.
+  bot.world = {
+    nukeThreat: 0,
+    leader: null,
+    leaderIsThreat: false,
+    collapsing: {},
+    progress: 0.3,
+  };
+  bot.territory.hostile = [];
+  me._units.length = 0;
+  for (let k = 0; k < 3; k++)
+    me._units.push(makeUnit(UnitType.MissileSilo, cluster + k * 40, me, 2, 0)); // 6 idle slots
+  check("idle launch capacity is counted", bot.idleSlots(me) === 6);
+
+  const siloSite = bot.territory.interior[0];
+  sent.length = 0;
+  bot.assess(V3, me);
+  bot.spendGold(V3, me, [
+    {
+      tile: siloSite,
+      actions: {
+        buildableUnits: [
+          { type: UnitType.MissileSilo, canBuild: siloSite, canUpgrade: false, cost: 1000000n },
+        ],
+      },
+    },
+  ]);
+  check(
+    "no tenth silo while six missiles sit unfired",
+    !sent.some((i) => i.unit === UnitType.MissileSilo),
+    JSON.stringify(sent.map((s) => s.unit)),
+  );
+
+  console.log("\n36. air defence scales with what there is to lose");
+  // One launcher covering a whole empire is how two warheads end a match.
+  me._units.length = 0;
+  const built = [];
+  for (let k = 0; k < 12; k++) {
+    const t = cluster + k * 37;
+    me._units.push(makeUnit(k % 2 ? UnitType.City : UnitType.Port, t, me, 1, 0));
+    built.push(t);
+  }
+  me._units.push(makeUnit(UnitType.SAMLauncher, cluster + 500, me, 1, 0));
+  me._gold = 25000000;
+  bot.assess(V3, me);
+  sent.length = 0;
+  const samSite = bot.territory.interior[2];
+  // One tile holds one structure, so the two options go on separate sites.
+  let siloAlt = samSite;
+  for (const t of bot.territory.interior)
+    if (V3.euclideanDistSquared(t, samSite) > 25 * 25) {
+      siloAlt = t;
+      break;
+    }
+  bot.spendGold(V3, me, [
+    {
+      tile: samSite,
+      actions: {
+        buildableUnits: [
+          { type: UnitType.SAMLauncher, canBuild: samSite, canUpgrade: false, cost: 1500000n },
+        ],
+      },
+    },
+    {
+      tile: siloAlt,
+      actions: {
+        buildableUnits: [
+          { type: UnitType.MissileSilo, canBuild: siloAlt, canUpgrade: false, cost: 1000000n },
+        ],
+      },
+    },
+  ]);
+  check(
+    "twelve structures behind one launcher buys another launcher",
+    sent.some((i) => i.unit === UnitType.SAMLauncher),
+    JSON.stringify(sent.map((s) => s.type + ":" + s.unit)),
+  );
+  const samFirst = sent.findIndex((i) => i.unit === UnitType.SAMLauncher);
+  const siloFirst = sent.findIndex((i) => i.unit === UnitType.MissileSilo);
+  check(
+    "and the launcher is bought ahead of another silo",
+    samFirst >= 0 && (siloFirst < 0 || samFirst < siloFirst),
+    JSON.stringify(sent.map((s) => s.unit)),
+  );
+
+  // With the screen wide enough, the gold goes into range instead.
+  me._units.length = 0;
+  for (let k = 0; k < 12; k++)
+    me._units.push(makeUnit(UnitType.City, cluster + k * 37, me, 1, 0));
+  for (let k = 0; k < 6; k++)
+    me._units.push(makeUnit(UnitType.SAMLauncher, cluster + 900 + k * 37, me, 1, 0));
+  bot.assess(V3, me);
+  sent.length = 0;
+  bot.spendGold(V3, me, [
+    {
+      tile: samSite,
+      actions: {
+        buildableUnits: [
+          {
+            type: UnitType.SAMLauncher,
+            canBuild: samSite,
+            canUpgrade: 99,
+            cost: 3000000n,
+            upgradeCosts: [3000000n],
+          },
+        ],
+      },
+    },
+  ]);
+  check(
+    "a covered empire upgrades its launchers instead",
+    sent.some(
+      (i) => i.type === "upgrade_structure" && i.unit === UnitType.SAMLauncher,
+    ),
+    JSON.stringify(sent.map((s) => s.type + ":" + s.unit)),
+  );
+  bot.stop();
+
   console.log(
     "\n" +
       (failures === 0
