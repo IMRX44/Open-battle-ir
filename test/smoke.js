@@ -931,6 +931,11 @@ async function pump(ticks) {
   console.log("\n20. the planner does several things at once");
   // The complaint the planner exists to fix: the old code either bought one
   // building or moved troops, never both.
+  // The game keeps every structure 15 tiles from every other, so a cramped
+  // territory can only take one building per cycle no matter how rich we are.
+  // Give ourselves room for several.
+  for (let y = 20; y <= 80; y++)
+    for (let x = 96; x <= 112; x++) if (LAND[y * W + x]) owner[y * W + x] = 1;
   me._in = [];
   me._out = [];
   me._units.length = 0;
@@ -1203,6 +1208,245 @@ async function pump(ticks) {
       "spawn " + sx + "," + sy + " — team " + Math.round(dMate) + " rival " + Math.round(dRival),
     );
   }
+  bot.stop();
+
+  console.log("\n28. the opening is about income, not cities");
+  // A city raises the troop ceiling by 250,000, which is worth nothing while
+  // the army sits at a quarter of the ceiling it already has. The reported
+  // failure was five million gold turned into seven cities and one port.
+  const V2 = OBA.view();
+  bot.world = {
+    nukeThreat: 0,
+    leader: null,
+    leaderIsThreat: false,
+    collapsing: {},
+    progress: 0.1,
+  };
+  bot.territory.hostile = []; // quiet borders, so defence is not the answer
+  // Far enough apart that the game's 15-tile rule is not what is being tested.
+  const quay = bot.territory.shore[0];
+  let inland = bot.territory.interior[0];
+  for (const t of bot.territory.interior)
+    if (V2.euclideanDistSquared(t, quay) > 30 * 30) {
+      inland = t;
+      break;
+    }
+  const openingSurvey = [
+    {
+      tile: quay,
+      actions: {
+        buildableUnits: [
+          { type: UnitType.Port, canBuild: quay, canUpgrade: false, cost: 125000n },
+        ],
+      },
+    },
+    {
+      tile: inland,
+      actions: {
+        buildableUnits: [
+          { type: UnitType.City, canBuild: inland, canUpgrade: false, cost: 125000n },
+        ],
+      },
+    },
+  ];
+
+  me._units.length = 0;
+  me._gold = 5000000;
+  me._troops = maxT * 0.25; // a fresh spawn: nowhere near the ceiling
+  bot.assess(V2, me);
+  sent.length = 0;
+  bot.spendGold(V2, me, openingSurvey);
+  const opening = sent.filter((i) => i.type === "build_unit");
+  check(
+    "the first thing bought is a port, not a city",
+    opening.length > 0 && opening[0].unit === UnitType.Port,
+    JSON.stringify(opening.map((o) => o.unit)),
+  );
+
+  // Same board, but now the army is pressed against its ceiling — that is
+  // when raising the ceiling is finally worth the gold.
+  me._units.length = 0;
+  me._troops = maxT * 0.85;
+  bot.assess(V2, me);
+  sent.length = 0;
+  bot.spendGold(V2, me, openingSurvey);
+  const late = sent.filter((i) => i.type === "build_unit");
+  check(
+    "but a capped army does buy the city",
+    late.some((b) => b.unit === UnitType.City),
+    JSON.stringify(late.map((o) => o.unit)),
+  );
+
+  console.log("\n29. saving beats buying badly");
+  // With nothing worth its price on offer, gold should stay in the bank.
+  me._units.length = 0;
+  me._troops = maxT * 0.25;
+  bot.assess(V2, me);
+  sent.length = 0;
+  bot.spendGold(V2, me, [
+    {
+      tile: inland,
+      actions: {
+        buildableUnits: [
+          // The fourth city onward costs a million, and the ceiling it raises
+          // is one we are nowhere near.
+          { type: UnitType.City, canBuild: inland, canUpgrade: false, cost: 1000000n },
+        ],
+      },
+    },
+  ]);
+  check(
+    "a million-gold city is refused while the ceiling is slack",
+    sent.length === 0,
+    JSON.stringify(sent.map((s) => s.unit)),
+  );
+
+  console.log("\n30. launchers stand over the cluster");
+  // "Put a SAM wherever five things are built" — and not on empty ground.
+  me._units.length = 0;
+  const hub = bot.territory.interior[0];
+  for (let k = 0; k < 6; k++)
+    me._units.push(makeUnit(UnitType.City, hub + k * W, me, 1, 0));
+  const samPicks = bot.samSites(V2, me, bot.territory.interior, 3);
+  check("finds somewhere to shelter", samPicks.length > 0);
+  if (samPicks.length) {
+    const coverCount = (t) =>
+      me._units.filter((u) => V2.euclideanDistSquared(t, u.tile()) <= 70 * 70).length;
+    const poolAvg =
+      bot.territory.interior.reduce((a, t) => a + coverCount(t), 0) /
+      bot.territory.interior.length;
+    check(
+      "and the spot it picks covers more than an average one",
+      coverCount(samPicks[0]) >= Math.max(3, poolAvg),
+      "covers " + coverCount(samPicks[0]) + " vs average " + poolAvg.toFixed(1),
+    );
+  }
+
+  // "Wherever more than five things are built, put a launcher over them" —
+  // even with nobody holding a silo yet, that much investment in one place is
+  // worth covering.
+  me._units.length = 0;
+  for (let k = 0; k < 6; k++)
+    me._units.push(makeUnit(UnitType.City, hub + k * W, me, 1, 0));
+  foe._units.length = 0; // nobody can nuke us at all
+  bot.survey(V2, me);
+  me._gold = 20000000;
+  sent.length = 0;
+  const cover = bot.territory.interior.find(
+    (t) => V2.euclideanDistSquared(t, hub) > 40 * 40,
+  );
+  bot.spendGold(V2, me, [
+    {
+      tile: cover,
+      actions: {
+        buildableUnits: [
+          { type: UnitType.SAMLauncher, canBuild: cover, canUpgrade: false, cost: 1500000n },
+        ],
+      },
+    },
+  ]);
+  check(
+    "a cluster of six structures earns a launcher even with no enemy silos",
+    sent.some((i) => i.unit === UnitType.SAMLauncher),
+    JSON.stringify(sent.map((s) => s.type + ":" + s.unit)),
+  );
+
+  console.log("\n31. structures spread out");
+  // Seven cities in one pocket is one warhead away from no cities.
+  me._units.length = 0;
+  const cluster = bot.territory.interior[0];
+  for (let k = 0; k < 5; k++)
+    me._units.push(makeUnit(UnitType.City, cluster + k, me, 1, 0));
+  const sites = bot.rankSites(V2, me, bot.territory.interior, 5);
+  const distFromCluster = (t) => Math.sqrt(V2.euclideanDistSquared(t, cluster));
+  const pickedAvg = sites.reduce((a, t) => a + distFromCluster(t), 0) / sites.length;
+  const poolAvg2 =
+    bot.territory.interior.reduce((a, t) => a + distFromCluster(t), 0) /
+    bot.territory.interior.length;
+  check(
+    "new sites are pushed away from what we already built",
+    pickedAvg > poolAvg2,
+    "picked " + Math.round(pickedAvg) + " vs pool " + Math.round(poolAvg2),
+  );
+
+  console.log("\n32. infinite gold");
+  // With every price at zero the trade-off disappears: build out to the caps.
+  me._units.length = 0;
+  me._gold = 0; // the lobby option zeroes prices, not the wallet
+  bot._announcedFree = false;
+  const freeSurvey = [];
+  // Explicitly spread sites, so the 15-tile rule is not what limits the count.
+  for (const [fx, fy] of [
+    [85, 20],
+    [105, 25],
+    [85, 50],
+    [105, 55],
+    [85, 80],
+    [105, 85],
+  ]) {
+    const t = game.ref(fx, fy);
+    freeSurvey.push({
+      tile: t,
+      actions: {
+        buildableUnits: [
+          { type: UnitType.City, canBuild: t, canUpgrade: false, cost: 0n },
+          { type: UnitType.MissileSilo, canBuild: t, canUpgrade: false, cost: 0n },
+          { type: UnitType.SAMLauncher, canBuild: t, canUpgrade: false, cost: 0n },
+        ],
+      },
+    });
+  }
+  bot.assess(V2, me);
+  sent.length = 0;
+  bot.spendGold(V2, me, freeSurvey);
+  const freeBuys = sent.filter((i) => i.type === "build_unit");
+  check(
+    "buys far more per cycle when nothing costs anything",
+    freeBuys.length >= 4,
+    "bought " + freeBuys.length,
+  );
+  check(
+    "and still spaces them 15 tiles apart as the game requires",
+    freeBuys.every((a, i) =>
+      freeBuys.every(
+        (b, j) => i === j || V2.euclideanDistSquared(a.tile, b.tile) >= 15 * 15,
+      ),
+    ),
+  );
+  check("it notices the free board by itself", bot._announcedFree === true);
+
+  console.log("\n33. it expands from the very first tick");
+  // A human spawns with 25,000 troops against a cap of ~102,000 — 24%, which
+  // the band table calls "critical". Refusing to expand there meant never
+  // starting at all, which is exactly what was reported.
+  owner.fill(0);
+  for (let y = 48; y <= 52; y++)
+    for (let x = 100; x <= 104; x++) if (LAND[y * W + x]) owner[y * W + x] = 1;
+  game._players = [me];
+  me._units.length = 0;
+  me._in = [];
+  me._out = [];
+  me._gold = 0;
+  me._troops = 25000;
+  me._spawned = true;
+  game._spawn = false;
+  bot.territory = null;
+  bot.islands = null;
+  bot.next = {};
+  bot.running = true;
+  sent.length = 0;
+  await pump(40);
+  const opener = sent.find((i) => i.type === "attack" && i.targetID === null);
+  check(
+    "a fresh spawn attacks neutral ground immediately",
+    !!opener,
+    JSON.stringify(sent.map((s) => s.type)),
+  );
+  check(
+    "and commits a real share of a 25k army",
+    !!opener && opener.troops > 8000,
+    opener ? "sent " + opener.troops : "",
+  );
   bot.stop();
 
   console.log(

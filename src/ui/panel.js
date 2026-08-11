@@ -412,6 +412,7 @@
     { key: "nukes", fa: "سلاح هسته‌ای", icon: "☢️" },
     { key: "diplomacy", fa: "اتحاد و دیپلماسی", icon: "🤝" },
     { key: "distrust", fa: "اتحاد بله، اعتماد نه", icon: "🕵️" },
+    { key: "freeBuild", fa: "خرید نامحدود (طلای بی‌نهایت)", icon: "♾️" },
     { key: "betray", fa: "شکستن اتحاد در فرصت مناسب", icon: "🗡️" },
   ];
 

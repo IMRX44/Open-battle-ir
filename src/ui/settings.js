@@ -70,6 +70,7 @@
       distrust: true,
       diplomacy: true,
       betray: true,
+      freeBuild: false,
     },
   };
 

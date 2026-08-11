@@ -56,6 +56,10 @@
     boats: true,
     islands: false, //  hunt unclaimed islands by sea, not just when boxed in
     distrust: false, //  fortify allied borders and let doomed pacts lapse
+    // Infinite-gold lobbies quote every price as zero, which the planner
+    // notices on its own. Forcing it on is for the case where it cannot —
+    // host cheats granted mid-game, for instance.
+    freeBuild: false,
     diplomacy: true,
     betray: false, //  break alliances of opportunity
 
@@ -319,9 +323,14 @@
 
     // Garrison grows with the number of neighbours who could open a second
     // front, and with whatever is already on its way. An allied border still
-    // counts for something: the pact is a timer.
-    var base = max * (cfg.reserve + 0.06 * Math.min(fronts, 3) + 0.02 * Math.min(alliedFronts, 3));
-    var garrison = Math.max(base, pressure * 1.6);
+    // counts for something: the pact is a timer. With nobody touching us at
+    // all — the opening minutes, or an island — holding an army back defends
+    // nothing and only costs expansion.
+    var frac =
+      fronts === 0 && alliedFronts === 0
+        ? 0.04
+        : cfg.reserve + 0.06 * Math.min(fronts, 3) + 0.02 * Math.min(alliedFronts, 3);
+    var garrison = Math.max(max * frac, pressure * 1.6);
     var budget = Math.max(0, troops - garrison);
 
     // Never pour the entire free force into one operation while another
@@ -1007,6 +1016,92 @@
     }).slice(0, n);
   };
 
+  /**
+   * Build sites want two things at once: distance from anyone hostile, and
+   * distance from our own existing structures. Seven cities in one pocket is
+   * one warhead away from no cities, and it wastes the map — spread costs
+   * nothing and buys resilience.
+   */
+  Bot.prototype.rankSites = function (g, me, pool, n) {
+    var terr = this.territory;
+    var hostile = (terr && terr.hostile) || [];
+    var cand = sampleOf(pool || [], 300, this.rng);
+    if (!cand.length) return [];
+
+    var mine = this.unitTiles(me, U.City)
+      .concat(
+        this.unitTiles(me, U.Port),
+        this.unitTiles(me, U.Factory),
+        this.unitTiles(me, U.MissileSilo),
+        this.unitTiles(me, U.SAMLauncher),
+      )
+      .slice(0, 60);
+    var hs = sampleOf(hostile, 40, this.rng);
+
+    return rankBy(cand, function (t) {
+      var far = 0;
+      if (hs.length) {
+        var best = Infinity;
+        for (var i = 0; i < hs.length; i++) {
+          var d = g.euclideanDistSquared(t, hs[i]);
+          if (d < best) best = d;
+        }
+        far = Math.sqrt(best);
+      }
+      var apart = 200;
+      if (mine.length) {
+        var bestOwn = Infinity;
+        for (var k = 0; k < mine.length; k++) {
+          var d2 = g.euclideanDistSquared(t, mine[k]);
+          if (d2 < bestOwn) bestOwn = d2;
+        }
+        // Past about sixty tiles the extra separation stops buying anything,
+        // so cap it and let safety decide.
+        apart = Math.min(Math.sqrt(bestOwn), 60);
+      }
+      return far + apart * 1.6;
+    }).slice(0, n);
+  };
+
+  /**
+   * Where a launcher would cover the most of our own investment. A SAM is
+   * only worth its three million if it is standing over something — the
+   * cluster of cities and ports, not empty ground.
+   */
+  Bot.prototype.samSites = function (g, me, pool, n) {
+    var assets = this.unitTiles(me, U.City).concat(
+      this.unitTiles(me, U.Port),
+      this.unitTiles(me, U.Factory),
+      this.unitTiles(me, U.MissileSilo),
+    );
+    if (assets.length < 3) return [];
+    var cand = sampleOf(pool || [], 200, this.rng);
+    if (!cand.length) return [];
+    var covered = this.unitTiles(me, U.SAMLauncher);
+    var R2 = 70 * 70; // samRange at level 1
+
+    var ranked = rankBy(cand, function (t) {
+      var count = 0;
+      for (var i = 0; i < assets.length; i++)
+        if (g.euclideanDistSquared(t, assets[i]) <= R2) count++;
+      // Do not stack launchers on ground another one already covers.
+      var overlap = 0;
+      for (var k = 0; k < covered.length; k++)
+        if (g.euclideanDistSquared(t, covered[k]) <= R2) overlap++;
+      return count - overlap * 3;
+    });
+
+    // Only worth proposing where it actually shelters a cluster.
+    var out = [];
+    for (var i = 0; i < ranked.length && out.length < n; i++) {
+      var c = 0;
+      for (var k = 0; k < assets.length; k++)
+        if (g.euclideanDistSquared(ranked[i], assets[k]) <= R2) c++;
+      if (c >= 3) out.push(ranked[i]);
+    }
+    return out;
+  };
+
   Bot.prototype.unitTiles = function (me, type) {
     var out = [];
     try {
@@ -1064,8 +1159,12 @@
 
     if (cfg.attackEfficiency > 0) {
       var sit = this.sit || this.assess(g, me);
-      // Too thin to be spending anything: growth first, deterrence second.
-      if (sit.band === "critical") return;
+      // A thin army must not start a war, but unclaimed land is not a war.
+      // A player opens with 25,000 troops against a cap of 102,000 — 24%,
+      // which is "critical" by the band table — and the entire early game is
+      // spent taking free ground. Only real pressure stops the land grab; the
+      // garrison already protects what needs protecting.
+      if (sit.band === "critical" && sit.pressure > 0) return;
 
       // A neutral tile costs a flat mag/5 troops whatever the stack size, but
       // the conquest rate rises with it (the per-tile budget charge bottoms

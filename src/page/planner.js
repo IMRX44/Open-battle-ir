@@ -42,7 +42,10 @@
   // how many missiles it can have in the air at once, so that is also the
   // ceiling on how fast a player can throw warheads.
   var SILO_TARGET_LEVEL = 5;
-  var SAM_TARGET_LEVEL = 4;
+  // Range is 150 - 480/(level+5): 70 tiles at level 1, 113 at level 8. Against
+  // an opponent who answers a defence line with fifty warheads, depth here is
+  // worth more than another building.
+  var SAM_TARGET_LEVEL = 8;
 
   function num(v) {
     try {
@@ -177,8 +180,12 @@
     var world = this.world;
     if (!world) return;
 
-    var safe = this.rankSafe(g, terr.interior, 4);
-    var spread = this.rankSpread(g, terr.shore, this.unitTiles(me, U.Port), 3);
+    var safe = this.rankSites(g, me, terr.interior, 5);
+    // Coastline is the scarce resource early — the game keeps structures 15
+    // tiles apart, so a small territory has very few legal port sites and a
+    // thin survey misses them entirely. That is how a bot ends up with one
+    // port and seven cities.
+    var spread = this.rankSpread(g, terr.shore, this.unitTiles(me, U.Port), 6);
     var choke = this.rankChoke(
       g,
       (terr.hostile && terr.hostile.length ? terr.hostile : []).concat(
@@ -186,6 +193,7 @@
       ),
       3,
     );
+    var sams = this.samSites(g, me, terr.interior, 3);
     // Existing structures are surveyed too — that is where upgrades live, and
     // an upgraded SAM or silo is usually better value than a new one.
     var owned = this.unitTiles(me, U.SAMLauncher)
@@ -194,17 +202,45 @@
       .concat(this.unitTiles(me, U.Port).slice(0, 2));
 
     var tiles = [];
-    function add(list) {
-      for (var i = 0; i < list.length; i++)
-        if (list[i] !== undefined && tiles.indexOf(list[i]) === -1)
-          tiles.push(list[i]);
+
+    // Every ranker optimises one thing, so each one hands back a cluster: the
+    // safest sites are all in the same deep pocket, the narrowest necks are
+    // all on the same isthmus. Surveying a cluster means that after the first
+    // placement the game's 15-tile rule rejects every remaining option — one
+    // building per cycle, all of them in one corner. Spacing the survey out
+    // is what makes several purchases in one pass possible at all.
+    var MIN_APART = 17 * 17;
+    function addSpaced(list) {
+      for (var i = 0; i < list.length; i++) {
+        var t = list[i];
+        if (t === undefined || tiles.indexOf(t) !== -1) continue;
+        var ok = true;
+        for (var k = 0; k < tiles.length; k++) {
+          if (g.euclideanDistSquared(t, tiles[k]) < MIN_APART) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) tiles.push(t);
+      }
     }
-    add(safe);
-    add(spread);
-    add(choke);
-    add(owned);
+    // Interleave the pools so one ranker cannot take every slot.
+    addSpaced(spread.slice(0, 2));
+    addSpaced(safe.slice(0, 2));
+    addSpaced(choke.slice(0, 1));
+    addSpaced(sams);
+    addSpaced(spread);
+    addSpaced(safe);
+    addSpaced(choke);
+
+    // Upgrade sites are exempt: an upgrade happens where the structure
+    // already stands, so proximity is the point rather than a problem.
+    for (var oi = 0; oi < owned.length; oi++)
+      if (owned[oi] !== undefined && tiles.indexOf(owned[oi]) === -1)
+        tiles.push(owned[oi]);
+
     if (!tiles.length) return;
-    tiles = tiles.slice(0, 14);
+    tiles = tiles.slice(0, 18);
 
     this.busy.plan = true;
     var queries = [];
@@ -261,18 +297,60 @@
     var hasShore = terr.shore.length > 0;
     var threat = clamp((terr.hostile ? terr.hostile.length : 0) / 60, 0, 1);
     var nukeThreat = world.nukeThreat;
+    var sit = this.sit || {};
+
+    // A city raises the troop ceiling by 250,000. That is worthless while the
+    // army is nowhere near the ceiling it already has — growth is
+    // (10 + t^0.73/4) * (1 - t/max), so lifting `max` when t/max is 0.25
+    // changes almost nothing. Gold spent on cities this early is gold not
+    // spent on the ports that pay for everything later.
+    var capPressure = sit.max ? clamp(sit.troops / sit.max, 0, 1) : 0.5;
+    var cityUrgency = clamp((capPressure - 0.3) / 0.45, 0.08, 1);
+
+    // Trade income is the engine. Early on there is nothing else to build an
+    // economy out of, so the first few ports outrank everything.
+    var incomeUrgency = have.port < 4 ? 1 : clamp(1.4 - have.port / 8, 0.3, 1);
+
+    var free = this.freeBuilds(results);
 
     // Wants, expressed as 0..1 "how much do we still need one of these".
-    var want = {
-      city: clamp((2 + tiles / 700 - have.city) / 6, 0, 1),
-      port: hasShore ? clamp((1 + tiles / 1600 - have.port) / 4, 0, 1) : 0,
-      factory: clamp((tiles / 1500 - have.factory) / 4, 0, 1),
-      post: clamp(threat * 3 - have.post / 8, 0, 1),
-      // Warheads are how a stalled game gets unstuck, and the only answer to
-      // an opponent who has already built a wall of defence posts.
-      silo: cfg.nukes ? clamp((1 + tiles / 4000 - have.silo) / 3, 0, 1) : 0,
-      sam: clamp(nukeThreat * 2 - have.sam / 6, 0, 1),
-    };
+    var want = free
+      ? {
+          // Nothing costs anything, so the only question left is what the map
+          // has room for. Build out to the caps and keep the placement
+          // discipline — spread out, on chokepoints, over the clusters.
+          city: clamp(1 - have.city / cfg.maxCities, 0, 1),
+          port: hasShore ? clamp(1 - have.port / cfg.maxPorts, 0, 1) : 0,
+          factory: clamp(1 - have.factory / cfg.maxFactories, 0, 1),
+          post: clamp(1 - have.post / cfg.maxDefensePosts, 0, 1),
+          // More silos is more warheads in the air at once, and they are free.
+          silo: cfg.nukes ? clamp(1 - have.silo / 20, 0, 1) : 0,
+          sam: clamp(1 - have.sam / cfg.maxSams, 0, 1),
+        }
+      : {
+          city: clamp((2 + tiles / 700 - have.city) / 6, 0, 1) * cityUrgency,
+          port: hasShore
+            ? clamp((2 + tiles / 1200 - have.port) / 4, 0, 1) * incomeUrgency
+            : 0,
+          factory: clamp((tiles / 1500 - have.factory) / 4, 0, 1) * cityUrgency,
+          post: clamp(threat * 3 - have.post / 8, 0, 1),
+          // Warheads are how a stalled game gets unstuck, and the only answer
+          // to an opponent who has already built a wall of defence posts.
+          silo: cfg.nukes ? clamp((1 + tiles / 4000 - have.silo) / 3, 0, 1) : 0,
+          // Two reasons to want a launcher: somebody can shoot at us, or we
+          // have enough built up in one place that losing it to a single
+          // warhead would hurt. A cluster of cities with no cover over it is
+          // an invitation.
+          sam: clamp(
+            Math.max(
+              nukeThreat * 2,
+              have.city + have.port + have.factory + have.silo >= 5 ? 0.7 : 0,
+            ) -
+              have.sam / 6,
+            0,
+            1,
+          ),
+        };
 
     var options = [];
 
@@ -315,27 +393,57 @@
     if (!options.length) return;
 
     // Value density. Costs are divided by 250k so the numbers stay legible.
+    // With prices at zero there is no trade-off left to make, so rank on raw
+    // value and buy until the board runs out of legal places to put things.
+    function density(o) {
+      return free ? o.score : o.score / Math.max(0.2, o.cost / 250000);
+    }
     options.sort(function (a, b) {
-      return (
-        b.score / Math.max(0.2, b.cost / 250000) -
-        a.score / Math.max(0.2, a.cost / 250000)
-      );
+      return density(b) - density(a);
     });
 
     // Keep enough back to keep the missiles flying once silos exist; an idle
     // silo is a million gold doing nothing.
-    var reserve = have.silo > 0 && cfg.nukes ? 800000 * Math.min(have.silo, 3) : 0;
+    var reserve =
+      !free && have.silo > 0 && cfg.nukes ? 800000 * Math.min(have.silo, 3) : 0;
     var purse = gold - reserve;
 
+    // Gold sitting in the bank is not wasted; gold spent on a million-gold
+    // city whose troop ceiling we are nowhere near is. When nothing on offer
+    // is worth its price, save and come back when a port site opens up or the
+    // cheaper tier of something else does.
+    var floor = free ? -1 : tiles < 3000 ? 10 : 4;
+
+    var maxBuys = free ? 10 : 4;
     var bought = 0;
     var seen = {};
-    for (var o = 0; o < options.length && bought < 4; o++) {
+    var placed = [];
+    for (var o = 0; o < options.length && bought < maxBuys; o++) {
       var opt = options[o];
       if (opt.cost > purse) continue;
-      // One of each type per cycle: the cost curve doubles as we buy, so the
-      // second one this tick would be priced from stale numbers.
-      var key = opt.kind + ":" + opt.type;
+      if (density(opt) < floor) break; // the rest are worse — stop here
+
+      // One of each type per cycle, because the cost curve doubles as we buy
+      // and the second would be priced off stale numbers. When everything is
+      // free there is no curve, so only the tile has to be distinct.
+      var key = free ? opt.kind + ":" + opt.type + ":" + opt.tile : opt.kind + ":" + opt.type;
       if (seen[key]) continue;
+
+      // The game keeps structures 15 tiles apart; two placements in one cycle
+      // that violate that would have the second silently rejected. A site
+      // rejected for that reason must not count against the type, or one bad
+      // candidate would rule out every other site for it this cycle.
+      if (opt.kind === "build") {
+        var tooClose = false;
+        for (var pi = 0; pi < placed.length; pi++) {
+          if (g.euclideanDistSquared(opt.tile, placed[pi]) < 17 * 17) {
+            tooClose = true;
+            break;
+          }
+        }
+        if (tooClose) continue;
+        placed.push(opt.tile);
+      }
       seen[key] = true;
 
       if (opt.kind === "build") {
@@ -359,6 +467,33 @@
       this.stats.actions++;
       this.stats.builds++;
     }
+  };
+
+  /**
+   * Is this an infinite-gold game?
+   *
+   * The lobby option makes every structure cost literally zero, which the
+   * planner sees directly in the prices the game quotes back. Nothing needs
+   * configuring — if the board is free, the calculus changes on its own.
+   */
+  Bot.freeBuilds = function (results) {
+    if (this.cfg.freeBuild) return true;
+    var priced = 0;
+    var zero = 0;
+    for (var r = 0; r < results.length; r++) {
+      if (!results[r] || !results[r].actions) continue;
+      var list = results[r].actions.buildableUnits || [];
+      for (var i = 0; i < list.length; i++) {
+        priced++;
+        if (num(list[i].cost) <= 0) zero++;
+      }
+    }
+    var free = priced > 0 && zero === priced;
+    if (free && !this._announcedFree) {
+      this._announcedFree = true;
+      OBA.log("good", "طلای بی‌نهایت — حالت خرید نامحدود فعال شد");
+    }
+    return free;
   };
 
   /** What a new structure of this type is worth right now. */
@@ -476,14 +611,15 @@
     if (slots < 1) return;
 
     var gold = num(me.gold());
-    if (gold < 800000) return;
+    var freeGame = !!(this.cfg.freeBuild || this._announcedFree);
+    if (!freeGame && gold < 800000) return;
 
     var clusters = this.nukeTargets(g, me);
     if (!clusters.length) return;
 
     // Never fire more than the gold covers, and leave the economy alive.
-    var affordable = Math.floor(gold / 800000);
-    var salvo = Math.min(slots, affordable, 6);
+    var affordable = freeGame ? slots : Math.floor(gold / 800000);
+    var salvo = Math.min(slots, affordable, freeGame ? 12 : 6);
     if (salvo < 1) return;
 
     // Expand each cluster by how many warheads it needs to actually land.
@@ -522,7 +658,7 @@
             var bu = list[k];
             if (bu.type !== wanted || bu.canBuild === false) continue;
             var cost = num(bu.cost);
-            if (cost > purse) break;
+            if (!freeGame && cost > purse) break;
             OBA.sendIntent({
               type: "build_unit",
               unit: wanted,

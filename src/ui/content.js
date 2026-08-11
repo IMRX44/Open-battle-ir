@@ -193,6 +193,7 @@
       boats: b.boats,
       islands: b.islands,
       distrust: b.distrust,
+      freeBuild: b.freeBuild,
       diplomacy: b.diplomacy,
       betray: b.betray,
     };
