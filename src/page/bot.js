@@ -1594,10 +1594,12 @@
           var cost = num(bu.cost);
           if (bu.canBuild !== false) {
             if (cost > budget) return finish(false); // cannot afford it yet
+            // `canBuild` is a legality answer, not a destination — send the
+            // tile we chose, the way the game's own build menu does.
             OBA.sendIntent({
               type: "build_unit",
               unit: type,
-              tile: bu.canBuild,
+              tile: tile,
             });
             self.stats.actions++;
             self.stats.builds++;
@@ -2114,10 +2116,12 @@
           if (bu.type !== wanted) continue;
           if (bu.canBuild === false) return;
           if (num(bu.cost) > gold) return;
+          // For a warhead `canBuild` is the silo it would launch from; the
+          // intent has to carry where it should land.
           OBA.sendIntent({
             type: "build_unit",
             unit: wanted,
-            tile: bu.canBuild,
+            tile: best.tile,
             rocketDirectionUp: true,
           });
           self.stats.actions++;

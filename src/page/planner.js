@@ -377,7 +377,9 @@
           options.push({
             kind: "build",
             type: bu.type,
-            tile: bu.canBuild,
+            // `canBuild` says whether it is legal, not where it goes — for a
+            // warhead it is the launching silo. Build at the tile we surveyed.
+            tile: res.tile,
             cost: num(bu.cost),
             score: base,
           });
@@ -723,10 +725,12 @@
             if (bu.type !== rs[i].w || bu.canBuild === false) continue;
             var cost = num(bu.cost);
             if (!freeGame && cost > purse) break;
+            // `bu.canBuild` here is the silo the missile launches from. The
+            // intent carries where it lands.
             OBA.sendIntent({
               type: "build_unit",
               unit: rs[i].w,
-              tile: bu.canBuild,
+              tile: rs[i].c.tile,
               rocketDirectionUp: true,
             });
             purse -= cost;

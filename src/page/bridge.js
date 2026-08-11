@@ -526,10 +526,16 @@
         var cost = Number(bu.cost);
 
         if (bu.canBuild !== false) {
+          // `canBuild` answers "is this legal", not "where does it go". For a
+          // structure it is the adjusted placement; for a warhead it is the
+          // SILO the missile would launch from. The intent must carry the
+          // TARGET — the tile under the cursor — exactly as the game's own
+          // build menu sends it. Sending `canBuild` aims every missile at our
+          // own silo.
           var intent = {
             type: "build_unit",
             unit: unitType,
-            tile: bu.canBuild,
+            tile: tile,
           };
           if (NUKE_TYPES.indexOf(unitType) !== -1) {
             intent.rocketDirectionUp =

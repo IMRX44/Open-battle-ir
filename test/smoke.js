@@ -126,10 +126,24 @@ function makePlayer(game, smallID, id, opts) {
         let ok = canPlace;
         if (needsShore) ok = canPlace && game.isOceanShore(tile);
         if (needsWater) ok = game.isOcean(tile);
-        if (t === UnitType.AtomBomb || t === UnitType.HydrogenBomb) ok = true;
+        const isNuke = t === UnitType.AtomBomb || t === UnitType.HydrogenBomb;
         // A structure of this type standing on this tile is upgradable.
         const standing = p._units.find((u) => u.type() === t && u.tile() === tile);
         const cost = BigInt(COSTS[t] || 100000);
+        if (isNuke) {
+          // Mirrors PlayerImpl.nukeSpawn: for a warhead `canBuild` is the
+          // SILO it would launch from, not the target. Anything that treats
+          // it as a destination ends up nuking its own silo.
+          const silo = p._units.find((u) => u.type() === UnitType.MissileSilo);
+          return {
+            type: t,
+            canBuild: silo ? silo.tile() : false,
+            canUpgrade: false,
+            cost: cost,
+            overlappingRailroads: [],
+            ghostRailPaths: [],
+          };
+        }
         return {
           type: t,
           canBuild: ok && !standing ? tile : false,
@@ -554,6 +568,21 @@ async function pump(ticks) {
 
   const offMap = await OBA.quickBuild(UnitType.City, 9999, 9999, {});
   check("refuses coordinates off the map", offMap.ok === false && offMap.reason === "off_map");
+
+  // A warhead on a hotkey must land under the cursor, not on our own silo:
+  // `canBuild` for a nuke names the launching silo, never the destination.
+  me._units.push(makeUnit(UnitType.MissileSilo, cy * W + cx, me, 1, 0));
+  socketCalls.length = 0;
+  const bomb = await OBA.quickBuild(UnitType.AtomBomb, cx - 20, cy - 20, {});
+  const bombFrame = JSON.parse(socketCalls[socketCalls.length - 1] || "null");
+  check(
+    "a hotkeyed warhead targets the cursor, not the silo",
+    bomb.ok === true &&
+      bombFrame &&
+      bombFrame.intent.tile === (cy - 20) * W + (cx - 20),
+    JSON.stringify(bombFrame && bombFrame.intent),
+  );
+  me._units.length = 0;
 
   // With every transport gone the player must be told, not shown a fake success.
   OBA.state.gameSocket = null;
@@ -1496,6 +1525,22 @@ async function pump(ticks) {
     "with a 750k atom bomb, not a 5M hydrogen bomb, for a lone structure",
     !sent.some((i) => i.unit === UnitType.HydrogenBomb),
     JSON.stringify(sent.map((s) => s.unit)),
+  );
+
+  // The intent's tile is where the warhead LANDS. `canBuild` for a nuke is
+  // the silo it launches from, so anything that forwards `canBuild` bombs its
+  // own territory — which is exactly what happened in play.
+  const shot = sent.find((i) => i.type === "build_unit");
+  const ourSilo = cy * W + cx;
+  check(
+    "the warhead is aimed at the enemy, not at our own silo",
+    !!shot && shot.tile !== ourSilo,
+    shot ? "aimed at " + shot.tile + ", silo is at " + ourSilo : "nothing fired",
+  );
+  check(
+    "and it lands on an enemy structure",
+    !!shot && foe._units.some((u) => u.tile() === shot.tile),
+    shot ? "tile " + shot.tile : "",
   );
 
   console.log("\n35. idle silos are not worth building");
