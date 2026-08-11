@@ -87,8 +87,11 @@ function makePlayer(game, smallID, id, opts) {
     outgoingAttacks: () => p._out,
     incomingAttacks: () => p._in,
     allies: () => [],
-    isFriendly: () => false,
+    _friends: {}, // smallID -> true
+    isFriendly: (o) => !!(o && p._friends[o.smallID()]),
     isTraitor: () => false,
+    betrayals: () => opts.betrayals || 0,
+    team: () => (opts.team === undefined ? null : opts.team),
     isRequestingAllianceWith: () => false,
     borderTiles: async () => {
       const set = new Set();
@@ -124,11 +127,15 @@ function makePlayer(game, smallID, id, opts) {
         if (needsShore) ok = canPlace && game.isOceanShore(tile);
         if (needsWater) ok = game.isOcean(tile);
         if (t === UnitType.AtomBomb || t === UnitType.HydrogenBomb) ok = true;
+        // A structure of this type standing on this tile is upgradable.
+        const standing = p._units.find((u) => u.type() === t && u.tile() === tile);
+        const cost = BigInt(COSTS[t] || 100000);
         return {
           type: t,
-          canBuild: ok ? tile : false,
-          canUpgrade: false,
-          cost: BigInt(COSTS[t] || 100000),
+          canBuild: ok && !standing ? tile : false,
+          canUpgrade: standing ? standing.id() : false,
+          cost: cost,
+          upgradeCosts: standing ? [cost * 2n] : undefined,
           overlappingRailroads: [],
           ghostRailPaths: [],
         };
@@ -152,15 +159,24 @@ const COSTS = {
   "Hydrogen Bomb": 5000000,
 };
 
-function makeUnit(type, tile, ownerPlayer) {
-  return {
+let unitSeq = 1;
+function makeUnit(type, tile, ownerPlayer, level, queued) {
+  const u = {
+    _id: unitSeq++,
+    _level: level || 1,
+    _queue: [],
     type: () => type,
     tile: () => tile,
     owner: () => ownerPlayer,
     isActive: () => true,
     isUnderConstruction: () => false,
-    level: () => 1,
+    id: () => u._id,
+    level: () => u._level,
+    // A silo of level N can hold N missiles; the queue is what is already up.
+    missileTimerQueue: () => u._queue,
   };
+  for (let i = 0; i < (queued || 0); i++) u._queue.push(0);
+  return u;
 }
 
 const game = {
@@ -241,6 +257,11 @@ const game = {
     for (const p of game._players) all.push(...p.units(...types));
     return all;
   },
+  numLandTiles: () => {
+    let n = 0;
+    for (let i = 0; i < LAND.length; i++) if (LAND[i]) n++;
+    return n;
+  },
   config: () => ({
     maxTroops: (p) => 2 * (Math.pow(p.numTilesOwned(), 0.6) * 1000 + 50000),
     structureMinDist: () => 15,
@@ -305,7 +326,7 @@ sandbox.WebSocket.prototype.send = function (data) {
 };
 
 vm.createContext(sandbox);
-for (const f of ["src/page/bridge.js", "src/page/bot.js"]) {
+for (const f of ["src/page/bridge.js", "src/page/bot.js", "src/page/planner.js"]) {
   vm.runInContext(fs.readFileSync(path.join(ROOT, f), "utf8"), sandbox, {
     filename: f,
   });
@@ -905,6 +926,283 @@ async function pump(ticks) {
       V.euclideanDistSquared(bot.territory.shore[1], existingPort),
     "best " + V.euclideanDistSquared(portRanked[0], existingPort),
   );
+  bot.stop();
+
+  console.log("\n20. the planner does several things at once");
+  // The complaint the planner exists to fix: the old code either bought one
+  // building or moved troops, never both.
+  me._in = [];
+  me._out = [];
+  me._units.length = 0;
+  me._gold = 30000000;
+  me._troops = maxT * 0.9;
+  foe._troops = 8000;
+  bot.setConfig({ preset: "god" });
+  bot.territory = null;
+  bot.next = {};
+  bot.running = true;
+  sent.length = 0;
+  await pump(60);
+
+  const kinds = new Set(sent.map((i) => i.type));
+  const builds20 = sent.filter((i) => i.type === "build_unit" && i.unit !== UnitType.AtomBomb && i.unit !== UnitType.HydrogenBomb);
+  const distinctTypes = new Set(builds20.map((b) => b.unit));
+  check(
+    "buys more than one kind of structure",
+    distinctTypes.size >= 2,
+    [...distinctTypes].join(","),
+  );
+  check(
+    "and moves troops in the same window",
+    kinds.has("attack"),
+    [...kinds].join(","),
+  );
+  check(
+    "several purchases land per planning pass",
+    builds20.length >= 3,
+    "builds " + builds20.length,
+  );
+
+  console.log("\n21. gold buys the best value first");
+  // The whole point of ranking by score per unit cost: a 50k defence post
+  // that seals a contested front must outrank a 3M SAM we have no use for.
+  bot.world = {
+    nukeThreat: 0,
+    leader: null,
+    leaderIsThreat: false,
+    collapsing: {},
+    progress: 0.2,
+  };
+  bot.territory.hostile = bot.territory.border.slice(0, 60);
+  me._gold = 400000;
+  sent.length = 0;
+  const survey = [
+    {
+      tile: bot.territory.interior[0],
+      actions: {
+        buildableUnits: [
+          { type: UnitType.DefensePost, canBuild: bot.territory.interior[0], canUpgrade: false, cost: 50000n },
+          { type: UnitType.SAMLauncher, canBuild: bot.territory.interior[0], canUpgrade: false, cost: 1500000n },
+          { type: UnitType.Factory, canBuild: bot.territory.interior[0], canUpgrade: false, cost: 200000n },
+        ],
+      },
+    },
+  ];
+  bot.spendGold(OBA.view(), me, survey);
+  const firstBuy = sent.find((i) => i.type === "build_unit");
+  check(
+    "the cheap high-value option is taken first",
+    !!firstBuy && firstBuy.unit === UnitType.DefensePost,
+    JSON.stringify(sent.map((s) => s.unit)),
+  );
+  check(
+    "nothing unaffordable is ordered",
+    !sent.some((i) => i.unit === UnitType.SAMLauncher),
+  );
+
+  console.log("\n22. warheads at scale");
+  // A level-N silo holds N missiles at once, so three level-three silos can
+  // put nine in the air. Firing one every forty ticks is not the same game.
+  me._units.length = 0;
+  me._gold = 40000000;
+  for (let k = 0; k < 3; k++)
+    me._units.push(makeUnit(UnitType.MissileSilo, cy * W + (cx + k), me, 3, 0));
+  foe._units.length = 0;
+  for (let k = 0; k < 10; k++)
+    foe._units.push(makeUnit(UnitType.City, (cy + (k % 5)) * W + (cx - 12 - ((k / 5) | 0)), foe));
+  // A launcher over the cluster: one warhead would be intercepted, a salvo
+  // gets through while it reloads.
+  foe._units.push(makeUnit(UnitType.SAMLauncher, cy * W + (cx - 12), foe, 1, 0));
+  bot.survey(OBA.view(), me);
+  sent.length = 0;
+  bot.busy.nuke = false;
+  bot.planNukes(OBA.view(), me);
+  await sleep(5);
+  const salvo = sent.filter(
+    (i) => i.type === "build_unit" && (i.unit === UnitType.AtomBomb || i.unit === UnitType.HydrogenBomb),
+  );
+  check("fires a salvo, not a single missile", salvo.length >= 2, "fired " + salvo.length);
+  check(
+    "saturates a launcher-covered cluster instead of feeding it one at a time",
+    salvo.filter((s) => s.tile === salvo[0].tile).length >= 2,
+    JSON.stringify(salvo.map((s) => s.tile)),
+  );
+
+  console.log("\n23. it upgrades its own silos and launchers");
+  // SAM level is interception range (70 tiles at level 1, 118 at level 10)
+  // and silo level is concurrent missiles — both matter more than another
+  // building once an opponent starts throwing warheads.
+  me._units.length = 0;
+  const samTile = bot.territory.interior[0];
+  const siloTile = bot.territory.interior[1];
+  me._units.push(makeUnit(UnitType.SAMLauncher, samTile, me, 1, 0));
+  me._units.push(makeUnit(UnitType.MissileSilo, siloTile, me, 1, 0));
+  // Three enemy silos and a quiet land border: warheads are the threat, so
+  // interception range is what the gold should be buying.
+  foe._units.length = 0;
+  for (let k = 0; k < 3; k++)
+    foe._units.push(makeUnit(UnitType.MissileSilo, (cy + k) * W + (cx - 12), foe, 1, 0));
+  bot.territory.hostile = [];
+  me._gold = 40000000;
+  bot.survey(OBA.view(), me);
+  sent.length = 0;
+  bot.busy.plan = false;
+  bot.planEconomy(OBA.view(), me);
+  await sleep(20);
+  const air = sent.filter(
+    (i) =>
+      i.unit === UnitType.SAMLauncher &&
+      (i.type === "build_unit" || i.type === "upgrade_structure"),
+  );
+  check(
+    "puts gold into air defence once the enemy has silos",
+    air.length > 0,
+    JSON.stringify(sent.map((s) => s.type + ":" + s.unit)),
+  );
+
+  // Coverage first, depth second. Once launchers blanket the territory a new
+  // one adds nothing, so the remaining value is in range — level 1 intercepts
+  // at 70 tiles, level 10 at 118 — and the gold should go into levels.
+  for (let k = 0; k < 12; k++)
+    me._units.push(makeUnit(UnitType.SAMLauncher, samTile + k, me, 1, 0));
+  bot.survey(OBA.view(), me);
+  sent.length = 0;
+  bot.spendGold(OBA.view(), me, [
+    {
+      tile: samTile,
+      actions: {
+        buildableUnits: [
+          {
+            type: UnitType.SAMLauncher,
+            canBuild: samTile + 99,
+            canUpgrade: 1,
+            cost: 1500000n,
+            upgradeCosts: [3000000n],
+          },
+        ],
+      },
+    },
+  ]);
+  const samMove = sent.find((i) => i.unit === UnitType.SAMLauncher);
+  check(
+    "and switches to upgrading once coverage is there",
+    !!samMove && samMove.type === "upgrade_structure",
+    JSON.stringify(sent.map((s) => s.type + ":" + s.unit)),
+  );
+
+  console.log("\n24. piling onto a collapsing player");
+  // Someone whose incoming attacks outweigh their army is being taken apart.
+  // If we do not take that ground, whoever is already eating them does.
+  me._units.length = 0;
+  foe._units.length = 0;
+  me._gold = 0;
+  me._troops = maxT * 0.42; // the growth peak — normally no optional war
+  // A real neighbour, not a rump state: big enough that none of the
+  // "already finished" shortcuts fire, small enough to be affordable.
+  for (let y = 20; y < 80; y++)
+    for (let x = 80; x < 96; x++)
+      if (LAND[y * W + x] && owner[y * W + x] === 3) owner[y * W + x] = 2;
+  foe._troops = 5000;
+  foe._in = [];
+  bot.territory = null;
+  bot.next = {};
+  sent.length = 0;
+  await pump(50);
+  const calm = sent.filter((i) => i.type === "attack" && i.targetID === "foe");
+  check("on the growth peak it holds off", calm.length === 0, JSON.stringify(calm));
+
+  foe._in = [{ attackerID: 3, targetID: 2, troops: 90000, id: "x", retreating: false }];
+  bot.next = {};
+  bot.territory = null;
+  sent.length = 0;
+  await pump(50);
+  const pileOn = sent.find((i) => i.type === "attack" && i.targetID === "foe");
+  check("but joins in once they are collapsing", !!pileOn, JSON.stringify(sent));
+
+  console.log("\n25. an alliance ends when the ally does");
+  me._friends[foe.smallID()] = true;
+  foe._friends[me.smallID()] = true;
+  bot.broke = {};
+  bot.territory = null;
+  bot.next = {};
+  sent.length = 0;
+  await pump(60);
+  const broke = sent.find((i) => i.type === "breakAlliance");
+  check("breaks the pact rather than watch a rival absorb them", !!broke,
+    JSON.stringify(sent.map((s) => s.type)));
+  check("and targets the right ally", !!broke && broke.recipient === "foe");
+  check(
+    "it never sends an attack the game would reject",
+    !sent.some((i) => i.type === "attack" && i.targetID === "foe"),
+  );
+  delete me._friends[foe.smallID()];
+  delete foe._friends[me.smallID()];
+  foe._in = [];
+
+  console.log("\n26. all three transports work");
+  for (const [ix, iy] of [
+    [135, 25],
+    [140, 70],
+    [125, 88],
+  ]) {
+    for (let y = iy - 4; y <= iy + 4; y++)
+      for (let x = ix - 4; x <= ix + 4; x++) {
+        if (x < 0 || y < 0 || x >= W || y >= H) continue;
+        LAND[y * W + x] = 1;
+        OCEAN[y * W + x] = 0;
+      }
+  }
+  me._troops = maxT * 0.95;
+  me._units.length = 0; // no transports afloat
+  bot.islands = null;
+  bot.territory = null;
+  bot.next = {};
+  bot.running = true;
+  await pump(60); // let the territory and island scans settle
+
+  // Measure a single dispatch: the mock never actually floats a transport, so
+  // repeated cycles would keep finding three free slots.
+  sent.length = 0;
+  bot.busy.boats = false;
+  bot.doIslands(OBA.view(), me);
+  await sleep(10);
+  const boats = sent.filter((i) => i.type === "boat");
+  check("launches more than one landing at a time", boats.length >= 2, "boats " + boats.length);
+  check("never more than the three the game allows", boats.length <= 3);
+  const beaches = new Set(boats.map((b) => b.dst));
+  check("each transport goes somewhere different", beaches.size === boats.length);
+  bot.stop();
+
+  console.log("\n27. team games spawn with the team");
+  const mate = makePlayer(game, 7, "mate", { troops: 1000, team: "A" });
+  const rival = makePlayer(game, 8, "rival", { troops: 1000, team: "B" });
+  game._players = [me, mate, rival];
+  Object.defineProperty(me, "team", { value: () => "A", configurable: true });
+  owner.fill(0);
+  // The team holds the far north-west; a rival holds the south.
+  for (let y = 4; y < 14; y++) for (let x = 4; x < 16; x++) owner[y * W + x] = 7;
+  for (let y = 86; y < 96; y++) for (let x = 4; x < 16; x++) owner[y * W + x] = 8;
+  me._spawned = false;
+  game._spawn = true;
+  bot.spawnEvals = 0;
+  bot.spawnPicked = null;
+  bot.next = {};
+  bot.running = true;
+  sent.length = 0;
+  await pump(12);
+  const teamSpawn = sent.find((i) => i.type === "spawn");
+  check("still picks a spawn", !!teamSpawn);
+  if (teamSpawn) {
+    const sx = teamSpawn.tile % W,
+      sy = (teamSpawn.tile / W) | 0;
+    const dMate = Math.hypot(sx - 10, sy - 9);
+    const dRival = Math.hypot(sx - 10, sy - 91);
+    check(
+      "and lands on the team's side of the map",
+      dMate < dRival,
+      "spawn " + sx + "," + sy + " — team " + Math.round(dMate) + " rival " + Math.round(dRival),
+    );
+  }
   bot.stop();
 
   console.log(

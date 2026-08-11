@@ -138,13 +138,17 @@
     expand: 10,
     attack: 12,
     economy: 18,
+    survey: 22,
+    plan: 14,
+    salvo: 18,
     defense: 45,
     navy: 40,
     boats: 50,
-    islandScan: 170,
-    islands: 55,
+    islandScan: 140,
+    islands: 26,
     nuke: 45,
     diplomacy: 55,
+    betray: 40,
   };
 
   /* ------------------------------------------------------------------ *
@@ -205,6 +209,7 @@
     this.spawnPicked = null;
     this.spawnScore = 0;
     this.allianceAsked = {}; // playerID -> tick
+    this.broke = {}; // playerID -> tick we tore up the pact
     this.stats = { actions: 0, builds: 0, attacks: 0, nukes: 0 };
   }
 
@@ -419,8 +424,10 @@
     if (this.due("territory", tick)) this.refreshTerritory(g, me);
     if (!this.territory) return;
 
-    if (this.cfg.attackEfficiency > 0) {
+    var planning = this.cfg.attackEfficiency > 0 && this.survey;
+    if (planning) {
       this.assess(g, me);
+      if (this.due("survey", tick)) this.survey(g, me);
       // Pulling troops out of a stalling offensive is the only reserve left
       // once the garrison is already committed.
       if (this.due("retreat", tick)) this.doRetreat(g, me);
@@ -428,10 +435,18 @@
 
     if (this.due("expand", tick)) this.doExpand(g, me);
     if (this.due("attack", tick)) this.doAttack(g, me);
-    if (this.cfg.economy && this.due("economy", tick)) this.doEconomy(g, me);
-    if (this.cfg.defense && this.due("defense", tick)) this.doDefense(g, me);
+
+    if (planning) {
+      // Gold and troops are separate budgets, so buying, building, nuking and
+      // invading all proceed in the same tick rather than taking turns.
+      if (this.cfg.economy && this.due("plan", tick)) this.planEconomy(g, me);
+      if (this.cfg.nukes && this.due("salvo", tick)) this.planNukes(g, me);
+    } else {
+      if (this.cfg.economy && this.due("economy", tick)) this.doEconomy(g, me);
+      if (this.cfg.defense && this.due("defense", tick)) this.doDefense(g, me);
+      if (this.cfg.nukes && this.due("nuke", tick)) this.doNukes(g, me);
+    }
     if (this.cfg.warships && this.due("navy", tick)) this.doNavy(g, me);
-    if (this.cfg.nukes && this.due("nuke", tick)) this.doNukes(g, me);
     if (this.cfg.islands) {
       if (this.due("islandScan", tick)) {
         try {
@@ -445,6 +460,7 @@
     if (this.cfg.boats && this.due("boats", tick)) this.doBoats(g, me);
     if (this.cfg.diplomacy && this.due("diplomacy", tick))
       this.doDiplomacy(g, me, tick);
+    if (planning && this.due("betray", tick)) this.doBreakAlliances(g, me, tick);
   };
 
   /* ------------------------------------------------------------------ *
@@ -508,10 +524,34 @@
     var land = new Float32Array(n);
     var ocean = new Float32Array(n);
     var claimed = new Uint8Array(n);
+    var friendCell = new Uint8Array(n);
     var freeTile = new Int32Array(n);
     var shoreTile = new Int32Array(n);
     freeTile.fill(-1);
     shoreTile.fill(-1);
+
+    // In a team game the side of the map your team is on decides the whole
+    // match: spawn with them and every border you hold is shared, spawn away
+    // from them and you fight alone on both sides.
+    var myTeam = null;
+    try {
+      myTeam = me.team ? me.team() : null;
+    } catch (e) {}
+    var mates = Object.create(null);
+    var haveMates = false;
+    if (myTeam !== null && myTeam !== undefined) {
+      try {
+        var ps = g.players() || [];
+        for (var pi = 0; pi < ps.length; pi++) {
+          var pp = ps[pi];
+          if (!pp || pp.smallID() === me.smallID()) continue;
+          if (pp.team && pp.team() === myTeam) {
+            mates[pp.smallID()] = 1;
+            haveMates = true;
+          }
+        }
+      } catch (e) {}
+    }
 
     // Sample every other tile on very large maps — the coarse grid absorbs
     // the loss and it halves the scan.
@@ -526,7 +566,8 @@
           if (g.isImpassable(t)) continue;
           land[ci]++;
           if (g.hasOwner(t)) {
-            claimed[ci] = 1;
+            if (haveMates && mates[g.ownerID(t)]) friendCell[ci] = 1;
+            else claimed[ci] = 1;
             continue;
           }
           if (freeTile[ci] < 0) freeTile[ci] = t;
@@ -575,6 +616,44 @@
     }
     var noRivals = queue.length === 0;
 
+    // Same walk again, sourced from wherever the team already stands.
+    var mateDist = null;
+    if (haveMates) {
+      mateDist = new Int32Array(n);
+      mateDist.fill(-1);
+      var mq = [];
+      for (var f = 0; f < n; f++)
+        if (friendCell[f]) {
+          mateDist[f] = 0;
+          mq.push(f);
+        }
+      var mi = 0;
+      while (mi < mq.length) {
+        var mc = mq[mi++];
+        var md = mateDist[mc] + 1;
+        if (md > 40) continue;
+        var mx = mc % gw,
+          my = (mc / gw) | 0;
+        if (mx > 0 && mateDist[mc - 1] === -1) {
+          mateDist[mc - 1] = md;
+          mq.push(mc - 1);
+        }
+        if (mx < gw - 1 && mateDist[mc + 1] === -1) {
+          mateDist[mc + 1] = md;
+          mq.push(mc + 1);
+        }
+        if (my > 0 && mateDist[mc - gw] === -1) {
+          mateDist[mc - gw] = md;
+          mq.push(mc - gw);
+        }
+        if (my < gh - 1 && mateDist[mc + gw] === -1) {
+          mateDist[mc + gw] = md;
+          mq.push(mc + gw);
+        }
+      }
+      if (!mq.length) mateDist = null; // nobody has spawned yet
+    }
+
     var NEAR = 5; // ~30 tiles — the land we can realistically take early
     var WIDE = 14; // ~84 tiles — is this a continent or a sandbar?
     var WET = 3; // ocean within ~18 tiles
@@ -617,13 +696,22 @@
       var wetShare = nearOcean / Math.max(1, nearOcean + nearLand);
       var shelter = 1 - Math.abs(wetShare - 0.5) / 0.5;
 
+      // Close to the team, but not on top of them — the game keeps spawns 30
+      // tiles apart anyway, and crowding wastes the ground between you.
+      var team = 0;
+      if (mateDist) {
+        var md2 = mateDist[ci3];
+        team = md2 < 0 ? 0 : md2 <= 2 ? 0.55 : md2 <= 9 ? 1 : Math.max(0, 1 - (md2 - 9) / 14);
+      }
+
       var score =
         room * 100 +
         wide * 45 +
         wet * 50 +
         shelter * 60 +
         (coastal ? 38 : 0) +
-        away * 95;
+        away * 95 +
+        team * 140;
 
       // Being jammed right up against a claimed cell is a losing opening.
       if (!noRivals && d >= 0 && d <= 2) score -= 160;
@@ -1128,6 +1216,10 @@
     // troops. Finishing off a dying neighbour is the exception — that is
     // territory, not a war.
     var mayOpenWar = sit.band !== "critical" && sit.band !== "growth";
+    // Past the halfway mark to the win threshold, sitting on the growth peak
+    // is no longer patience — it is letting somebody else finish first.
+    if (this.world && this.world.progress > 0.55 && sit.band !== "critical")
+      mayOpenWar = true;
 
     // Whatever we send must fit inside the single-operation cap, so a second
     // neighbour still meets a defended border.
@@ -1154,17 +1246,19 @@
       // do not fight at all.
       if (ceiling < needed) continue;
 
-      var tiles = Math.max(1, p.numTilesOwned());
-      var collapsing = tiles < 400 || D < myTroops * 0.05;
-      if (!mayOpenWar && !collapsing) continue;
+      // The game refuses attacks on anyone we are allied with, so a betrayal
+      // has to go through doBreakAlliances first and land here next cycle.
+      if (friendly) continue;
 
-      if (friendly) {
-        // Breaking a pact costs half defence and a fifth of our speed for
-        // thirty seconds — cheap, but only worth it for a target we can
-        // overrun inside that window.
-        if (!cfg.betray) continue;
-        if (D > myTroops * 0.35) continue;
-      }
+      var tiles = Math.max(1, p.numTilesOwned());
+      var world = this.world;
+      // Someone whose incoming attacks already outweigh their army is being
+      // dismantled: their troops are committed elsewhere and their ground is
+      // the cheapest on the board. If we do not take it, the player currently
+      // eating them grows instead.
+      var beingEaten = !!(world && world.collapsing && world.collapsing[sid]);
+      var collapsing = beingEaten || tiles < 400 || D < myTroops * 0.05;
+      if (!mayOpenWar && !collapsing) continue;
 
       var density = D / tiles; // troops defending each tile
       var edge = terr.enemyEdge[sid];
@@ -1181,13 +1275,19 @@
         (p.type() === PT.Bot ? 6 : 0) +
         (p.isTraitor && p.isTraitor() ? 5 : 0) +
         // A player already collapsing is free territory.
-        (collapsing ? 10 : 0) -
+        (collapsing ? 10 : 0) +
+        (beingEaten ? 14 : 0) +
+        // The game is won by owning 80% of the map. Whoever is closest to
+        // that is the only opponent whose growth actually costs us the game.
+        (world && world.leaderIsThreat && world.leader &&
+        world.leader.smallID() === sid
+          ? 16
+          : 0) -
         // Five times the defence in a thirty-tile radius. Go around it.
-        (fortified ? 25 : 0) -
-        (friendly ? 10 : 0);
+        (fortified ? 25 : 0);
 
       if (!best || score > best.score)
-        best = { p: p, score: score, needed: needed, friendly: friendly };
+        best = { p: p, score: score, needed: needed };
     }
     if (!best) return;
 
@@ -1199,13 +1299,69 @@
     this.stats.actions++;
     this.stats.attacks++;
     OBA.log(
-      best.friendly ? "warn" : "info",
-      (best.friendly ? "شکستن اتحاد و حمله به " : "حمله به ") +
-        safeName(best.p) +
-        " با " +
-        Math.round(send / 1000) +
-        "K نیرو",
+      "info",
+      "حمله به " + safeName(best.p) + " با " + Math.round(send / 1000) + "K نیرو",
     );
+  };
+
+  /**
+   * Alliances end on our terms, not theirs.
+   *
+   * The game blocks attacks between allies outright, so taking ground from
+   * one is a two-step move: break the pact this cycle, invade the next. Two
+   * situations justify it. An ally who is already being dismantled by someone
+   * else is not an ally for much longer — staying loyal just means watching a
+   * rival absorb them. And an ally weak enough to overrun inside the traitor
+   * penalty (half defence for thirty seconds) is territory we are declining
+   * to take for no reason.
+   */
+  Bot.prototype.doBreakAlliances = function (g, me, tick) {
+    var cfg = this.cfg;
+    if (!cfg.betray && !cfg.distrust) return;
+    var world = this.world;
+    var terr = this.territory;
+    if (!world || !terr) return;
+
+    var sit = this.sit;
+    var players;
+    try {
+      players = g.players() || [];
+    } catch (e) {
+      return;
+    }
+
+    for (var i = 0; i < players.length; i++) {
+      var p = players[i];
+      if (!p || p.smallID() === me.smallID() || !p.isAlive()) continue;
+      var friendly = false;
+      try {
+        friendly = me.isFriendly(p);
+      } catch (e) {}
+      if (!friendly) continue;
+
+      var last = this.broke[p.id()];
+      if (last !== undefined && tick - last < 200) continue;
+
+      var D = Math.max(1, p.troops());
+      var beingEaten = !!world.collapsing[p.smallID()];
+      // Only worth breaking for someone whose ground we can actually reach.
+      var adjacent = !!terr.enemyEdge[p.smallID()];
+      if (!adjacent) continue;
+
+      var canOverrun =
+        sit && sit.budget >= D * cfg.attackEfficiency && D < sit.troops * 0.35;
+
+      var reason = null;
+      if (beingEaten && cfg.distrust) reason = "متحد در حال نابودی";
+      else if (canOverrun && cfg.betray) reason = "فرصت";
+      if (!reason) continue;
+
+      this.broke[p.id()] = tick;
+      OBA.sendIntent({ type: "breakAlliance", recipient: p.id() });
+      this.stats.actions++;
+      OBA.log("warn", "لغو اتحاد با " + safeName(p) + " — " + reason);
+      return; // one pact at a time
+    }
   };
 
   /** Does the target keep a defence post covering the edge we would cross? */
@@ -1617,12 +1773,15 @@
     if (!terr || !terr.shore.length) return;
     if (!this.islands || !this.islands.targets.length) return;
 
-    // Three transports in flight is the hard cap.
+    // Three transports in flight is the hard cap — and all three should be
+    // working. On a big coastal start they are the fastest growth available:
+    // a landing claims ground the land border would take minutes to walk to.
     var afloat = 0;
     try {
       afloat = me.units(U.TransportShip).length;
     } catch (e) {}
-    if (afloat >= 3) return;
+    var slots = 3 - afloat;
+    if (slots < 1) return;
 
     var sit = this.sit || this.assess(g, me);
     var max = sit.max;
@@ -1636,44 +1795,78 @@
     if (budget < max * floor) return;
 
     var origin = terr.shore[(this.rng() * terr.shore.length) | 0];
-    var best = null;
+    var ranked = [];
     for (var i = 0; i < this.islands.targets.length; i++) {
       var isle = this.islands.targets[i];
       for (var k = 0; k < isle.shores.length; k++) {
         var t = isle.shores[k];
         if (g.hasOwner(t)) continue; // taken since the last scan
-        var d = g.euclideanDistSquared(origin, t);
-        // Bigger islands justify a longer crossing.
-        var value = isle.free * 40 - d;
-        if (!best || value > best.value) best = { tile: t, value: value };
+        // Bigger landmasses justify a longer crossing.
+        ranked.push({
+          tile: t,
+          value: isle.free * 40 - g.euclideanDistSquared(origin, t),
+        });
       }
     }
-    if (!best) return;
+    if (!ranked.length) return;
+    ranked.sort(function (a, b) {
+      return b.value - a.value;
+    });
+
+    // Spread the landings out: three transports converging on one beach is
+    // one landing with extra steps.
+    var picks = [];
+    for (var r = 0; r < ranked.length && picks.length < slots; r++) {
+      var ok = true;
+      for (var q = 0; q < picks.length; q++)
+        if (g.euclideanDistSquared(ranked[r].tile, picks[q]) < 40 * 40) ok = false;
+      if (ok) picks.push(ranked[r].tile);
+    }
+    if (!picks.length) return;
+
+    // A beachhead that arrives too small dies on the sand; one that takes the
+    // whole army leaves the homeland open. Split the allowance across the
+    // wave and cap it against the single-operation ceiling like any front.
+    var wave = Math.min(
+      Math.max(budget * (firstFoothold ? 0.32 : 0.2), max * 0.08),
+      sit.perAttackCap,
+      budget,
+    );
+    var each = Math.floor(wave / picks.length);
+    if (each < 1) return;
 
     this.busy.boats = true;
     var self = this;
-    var landing = best.tile;
-    me.bestTransportShipSpawn(landing)
-      .then(function (spawn) {
+    Promise.all(
+      picks.map(function (dst) {
+        return me
+          .bestTransportShipSpawn(dst)
+          .then(function (spawn) {
+            return spawn === false || spawn === undefined || spawn === null
+              ? null
+              : dst;
+          })
+          .catch(function () {
+            return null;
+          });
+      }),
+    )
+      .then(function (reachable) {
         if (!self.running) return;
-        if (spawn === false || spawn === undefined || spawn === null) return;
-        // A beachhead that arrives too small just dies on the sand; one that
-        // takes the whole army leaves the homeland open. Cap it against the
-        // single-operation ceiling like any other front.
-        var send = Math.floor(
-          Math.min(
-            Math.max(budget * (firstFoothold ? 0.32 : 0.2), max * 0.08),
-            sit.perAttackCap,
-            budget,
-          ),
-        );
-        if (send < 1) return;
-        OBA.sendIntent({ type: "boat", troops: send, dst: landing });
-        self.stats.actions++;
-        OBA.log(
-          "good",
-          firstFoothold ? "گرفتن پایگاه دوم روی جزیره" : "پیاده‌شدن روی سرزمین بی‌صاحب",
-        );
+        var launched = 0;
+        for (var j = 0; j < reachable.length; j++) {
+          if (reachable[j] === null) continue;
+          OBA.sendIntent({ type: "boat", troops: each, dst: reachable[j] });
+          self.stats.actions++;
+          launched++;
+        }
+        if (launched)
+          OBA.log(
+            "good",
+            (firstFoothold ? "گرفتن پایگاه دوم — " : "") +
+              launched +
+              " کشتی به سرزمین بی‌صاحب",
+          );
       })
       .catch(function () {})
       .then(function () {

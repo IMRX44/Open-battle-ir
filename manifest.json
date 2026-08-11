@@ -38,6 +38,7 @@
       "js": [
         "src/page/bridge.js",
         "src/page/bot.js",
+        "src/page/planner.js",
         "src/page/boot.js"
       ],
       "run_at": "document_start",
